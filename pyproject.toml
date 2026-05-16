@@ -1,0 +1,26 @@
+[project]
+name = "framewise-py"
+version = "0.1.0"
+description = "Multi-video synchronized viewer for calcium imaging analysis (napari-based)"
+requires-python = ">=3.10"
+dependencies = [
+    "pyqt6>=6.6",
+    "pyqtgraph>=0.13",
+    "h5py>=3.10",
+    "dask[array]>=2024.1",
+    "tifffile>=2024.1",
+    "imageio[ffmpeg]>=2.34",
+    "qtpy>=2.4",
+    "tdt>=0.6",
+    "napari[all]>=0.5",
+]
+
+[project.scripts]
+framewise = "framewise_py.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["framewise_py*"]
