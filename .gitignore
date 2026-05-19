@@ -58,3 +58,6 @@ test_data/
 # Local scratch / logs
 *.log
 .cache/
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
