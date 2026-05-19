@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -19,7 +20,8 @@ from PyQt6.QtWidgets import (
 
 from .master_clock import MasterClock
 from .panels import PanelManager
-from .sync import FILE_FILTER, SyncController, SyncManagerPanel
+from .settings import get_last_dir, set_last_dir_from_path, settings
+from .sync import FILE_FILTER, ResourceManagerPanel, SyncController
 
 # QTimer interval for playback ticks. 33ms ≈ 30Hz, smooth enough for any video
 # regardless of its native fps (each panel rounds master_time to its own frame).
@@ -32,10 +34,6 @@ PLAYBACK_SPEEDS = [
     ("2x", 2.0),
     ("4x", 4.0),
 ]
-
-SETTINGS_ORG = "framewise"
-SETTINGS_APP = "framewise-py"
-
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -54,15 +52,20 @@ class MainWindow(QMainWindow):
         self.panel_manager = PanelManager(self, master_clock=self.master_clock)
         self.sync_controller = SyncController()
 
-        self.sync_panel = SyncManagerPanel(self.sync_controller, self.panel_manager)
+        self.sync_panel = ResourceManagerPanel(self.sync_controller, self.panel_manager)
         self.sync_panel.add_video_requested.connect(self._add_videos)
-        self.sync_dock = QDockWidget("Sync Manager", self)
+        self.sync_dock = QDockWidget("Resource Manager", self)
         self.sync_dock.setWidget(self.sync_panel)
+        # Keep "sync_manager" objectName so QSettings windowState restore still
+        # finds this dock across the rename.
         self.sync_dock.setObjectName("sync_manager")
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.sync_dock)
 
-        # Playback timer — advances master_clock at PLAYBACK_TICK_MS rate.
+        # Playback timer — advances master_clock by real elapsed wall time so
+        # playback stays at true speed even if rendering can't keep up with
+        # PLAYBACK_TICK_MS (in which case we skip frames rather than slow down).
         self._playback_speed = 1.0
+        self._last_tick: float | None = None
         self._playback_timer = QTimer(self)
         self._playback_timer.setInterval(PLAYBACK_TICK_MS)
         self._playback_timer.timeout.connect(self._on_playback_tick)
@@ -137,9 +140,11 @@ class MainWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Open video files",
-            "",
+            get_last_dir(),
             FILE_FILTER,
         )
+        if paths:
+            set_last_dir_from_path(paths[0])
         for p in paths:
             self.add_video(p)
 
@@ -148,6 +153,7 @@ class MainWindow(QMainWindow):
     def _set_playing(self, playing: bool) -> None:
         if playing:
             self.act_play.setText("⏸ Pause")
+            self._last_tick = None
             self._playback_timer.start()
         else:
             self.act_play.setText("▶ Play")
@@ -157,13 +163,18 @@ class MainWindow(QMainWindow):
         self._playback_speed = PLAYBACK_SPEEDS[index][1]
 
     def _on_playback_tick(self) -> None:
-        dt = (PLAYBACK_TICK_MS / 1000.0) * self._playback_speed
-        self.master_clock.set_time(self.master_clock.time + dt)
+        now = time.monotonic()
+        if self._last_tick is None:
+            dt = PLAYBACK_TICK_MS / 1000.0
+        else:
+            dt = now - self._last_tick
+        self._last_tick = now
+        self.master_clock.set_time(self.master_clock.time + dt * self._playback_speed)
 
     # ----- Persistence -----
 
     def _restore_settings(self) -> None:
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        s = settings()
         geom = s.value("geometry")
         if geom is not None:
             self.restoreGeometry(geom)
@@ -172,7 +183,7 @@ class MainWindow(QMainWindow):
             self.restoreState(state)
 
     def _save_settings(self) -> None:
-        s = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        s = settings()
         s.setValue("geometry", self.saveGeometry())
         s.setValue("windowState", self.saveState())
 

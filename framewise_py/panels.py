@@ -93,6 +93,9 @@ class PanelManager:
         dock.setWidget(panel)
         dock.setObjectName(f"{kind}_{len(self._entries)}_{name}")
         dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        # X button truly deletes the dock (default would only hide it), so the
+        # destroyed-signal chain below fires and SyncController + UI clean up.
+        dock.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         entry = PanelEntry(panel=panel, dock=dock, path=path, kind=kind)
         self._entries.append(entry)

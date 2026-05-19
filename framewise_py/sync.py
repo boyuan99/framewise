@@ -1,8 +1,13 @@
-"""Sync group controller + dock widget UI.
+"""Sync group controller + Resource Manager dock UI.
 
-Each sync group is a set of VideoPanels that should scrub together. When any
-panel in a group emits frame_changed, the others are updated proportionally
-(by normalized time, so videos with different frame counts align by position).
+`SyncController` owns the cross-panel sync groups: when any base panel's frame
+changes, all other panels in the same group are scrubbed proportionally
+(normalized 0–1 position). Overlays within a panel do NOT participate in sync —
+they have their own independent playheads (see VideoPanel).
+
+`ResourceManagerPanel` is the dock UI: a hierarchical tree showing each panel
+and its overlays as children. Sync-group checkboxes appear only on top-level
+video panel rows.
 """
 
 from __future__ import annotations
@@ -15,14 +20,14 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
-    QLabel,
     QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from .settings import get_last_dir, set_last_dir_from_path
 from .video_panel import VideoPanel
 
 if TYPE_CHECKING:
@@ -39,7 +44,11 @@ FILE_FILTER = (
 
 class SyncController:
     """Tracks which VideoPanels belong to which sync groups and routes
-    frame_changed events between group members."""
+    frame_changed events between group members.
+
+    Note: only the base panel's frame_changed signal triggers sync. Overlay
+    scrubs intentionally do not fire frame_changed, so they stay isolated.
+    """
 
     def __init__(self) -> None:
         # Each group is a set of VideoPanel instances. Index = group id.
@@ -106,8 +115,11 @@ class SyncController:
             self._dispatching = False
 
 
-class SyncManagerPanel(QWidget):
-    """Dock widget UI showing the panel × group membership table."""
+class ResourceManagerPanel(QWidget):
+    """Hierarchical resource tree: panels at the top level with overlays as
+    children. Sync-group membership checkboxes live on the top-level video
+    rows only; overlays don't participate in sync.
+    """
 
     add_video_requested = pyqtSignal(list)  # list[Path] from file dialog
 
@@ -129,11 +141,15 @@ class SyncManagerPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        self.table = QTableWidget(0, 1)
-        self.table.setHorizontalHeaderLabels(["Group 1"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        layout.addWidget(self.table, stretch=1)
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(1 + self._controller.n_groups)
+        self.tree.setHeaderLabels(self._header_labels())
+        header = self.tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for i in range(1, self.tree.columnCount()):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.setRootIsDecorated(True)
+        layout.addWidget(self.tree, stretch=1)
 
         btn_row = QHBoxLayout()
         btn_add_group = QPushButton("+ Group")
@@ -156,76 +172,88 @@ class SyncManagerPanel(QWidget):
 
         layout.addLayout(btn_row)
 
-    def _refresh_table(self) -> None:
+    def _header_labels(self) -> list[str]:
+        return ["Resource"] + [f"Group {i + 1}" for i in range(self._controller.n_groups)]
+
+    def _refresh_tree(self) -> None:
         # During shutdown, dock destroyed signals can fire after this widget's
         # children are already gone — skip silently in that case.
         try:
-            entries = self._panel_manager.entries
-            groups = self._controller.n_groups
-            self.table.setRowCount(len(entries))
-            self.table.setColumnCount(groups)
-            self.table.setHorizontalHeaderLabels(
-                [f"Group {i+1}" for i in range(groups)]
-            )
-            self.table.setVerticalHeaderLabels(
-                [f"[{e.kind}] {e.panel.name}" for e in entries]
-            )
+            n_groups = self._controller.n_groups
+            self.tree.setColumnCount(1 + n_groups)
+            self.tree.setHeaderLabels(self._header_labels())
 
-            for row, entry in enumerate(entries):
-                for col in range(groups):
-                    if not isinstance(entry.panel, VideoPanel):
-                        self.table.setCellWidget(row, col, QLabel(""))
-                        continue
-                    cb = QCheckBox()
-                    cb.setChecked(self._controller.is_member(entry.panel, col))
-                    cb.stateChanged.connect(
-                        lambda state, p=entry.panel, g=col: self._controller.set_membership(
-                            p, g, state == Qt.CheckState.Checked.value
+            self.tree.clear()
+            for entry in self._panel_manager.entries:
+                top = QTreeWidgetItem([f"[{entry.kind}] {entry.panel.name}"])
+                self.tree.addTopLevelItem(top)
+
+                if isinstance(entry.panel, VideoPanel):
+                    for col in range(n_groups):
+                        self.tree.setItemWidget(
+                            top, col + 1, self._make_group_checkbox(entry.panel, col)
                         )
-                    )
-                    container = QWidget()
-                    h = QHBoxLayout(container)
-                    h.setContentsMargins(0, 0, 0, 0)
-                    h.addWidget(cb, alignment=Qt.AlignmentFlag.AlignCenter)
-                    self.table.setCellWidget(row, col, container)
+                    for ov in entry.panel._overlays:  # noqa: SLF001
+                        child = QTreeWidgetItem([f"[overlay {ov.kind}] {ov.name}"])
+                        top.addChild(child)
+                    top.setExpanded(True)
         except RuntimeError:
             return
 
+    def _make_group_checkbox(self, panel: VideoPanel, group_id: int) -> QWidget:
+        cb = QCheckBox()
+        cb.setChecked(self._controller.is_member(panel, group_id))
+        cb.stateChanged.connect(
+            lambda state, p=panel, g=group_id: self._controller.set_membership(
+                p, g, state == Qt.CheckState.Checked.value
+            )
+        )
+        container = QWidget()
+        h = QHBoxLayout(container)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(cb, alignment=Qt.AlignmentFlag.AlignCenter)
+        return container
+
     def _on_panel_added(self, entry: "PanelEntry") -> None:
-        # Sync grouping currently only applies to VideoPanels.
+        # Sync grouping currently only applies to VideoPanels. Subscribe to
+        # overlay changes so we can refresh the tree without polling.
         if isinstance(entry.panel, VideoPanel):
             self._controller.add_panel(entry.panel)
-        self._refresh_table()
+            entry.panel.overlay_added.connect(lambda *_: self._refresh_tree())
+            entry.panel.overlay_removed.connect(lambda *_: self._refresh_tree())
+        self._refresh_tree()
 
     def _on_panel_removed(self, entry: "PanelEntry") -> None:
         if isinstance(entry.panel, VideoPanel):
             self._controller.remove_panel(entry.panel)
-        self._refresh_table()
+        self._refresh_tree()
 
     def _add_group(self) -> None:
         self._controller.add_group()
-        self._refresh_table()
+        self._refresh_tree()
 
     def _remove_last_group(self) -> None:
         if self._controller.n_groups > 1:
             self._controller.remove_group(self._controller.n_groups - 1)
-            self._refresh_table()
+            self._refresh_tree()
 
     def _add_video(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Add video files",
-            "",
+            get_last_dir(),
             FILE_FILTER,
         )
         if paths:
+            set_last_dir_from_path(paths[0])
             self.add_video_requested.emit([str(p) for p in paths])
 
     def _add_tdt(self) -> None:
         directory = QFileDialog.getExistingDirectory(
             self,
             "Add TDT block (select block directory)",
-            "",
+            get_last_dir(),
         )
         if directory:
+            set_last_dir_from_path(directory)
             self.add_video_requested.emit([directory])
