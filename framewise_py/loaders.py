@@ -123,6 +123,104 @@ def _find_video_dataset(group: h5py.Group, path: str = "/") -> h5py.Dataset | No
     return None
 
 
+def _find_image_dataset(group: h5py.Group) -> h5py.Dataset | None:
+    """Recursively find the first 2D dataset (single image), or 3D with T==1."""
+    for _name, item in group.items():
+        if isinstance(item, h5py.Dataset):
+            if item.ndim == 2:
+                return item
+            if item.ndim == 3 and item.shape[0] == 1:
+                return item
+            if item.ndim == 3 and item.shape[-1] in (3, 4):
+                return item  # (H, W, C)
+        elif isinstance(item, h5py.Group):
+            found = _find_image_dataset(item)
+            if found is not None:
+                return found
+    return None
+
+
+# Extensions we recognize as "video-like" (multi-frame) for overlay routing.
+_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
+# Static-image-only extensions.
+_STATIC_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
+# TIFF/HDF5 can be either — inspected at load time.
+_AMBIGUOUS_EXTS = {".tif", ".tiff", ".h5", ".hdf5"}
+
+
+def load_overlay(path: str | Path) -> tuple[Any, str, str]:
+    """Load a file for use as an overlay layer.
+
+    Returns (data, kind, name) where:
+      - kind == "static": data is an ndarray of shape (H, W) or (H, W, C)
+      - kind == "video":  data is a lazy array of shape (T, H, W[, C]) with T >= 2
+
+    Routes by extension first, then inspects content for TIFF/HDF5.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise LoadError(f"File not found: {path}")
+
+    suffix = path.suffix.lower()
+
+    if suffix in _STATIC_IMAGE_EXTS:
+        return _load_static_image(path), "static", path.stem
+
+    if suffix in _VIDEO_EXTS:
+        return _load_video(path), "video", path.stem
+
+    if suffix in (".tif", ".tiff"):
+        arr = _load_tiff_any(path)
+        if arr.ndim == 2 or (arr.ndim == 3 and arr.shape[-1] in (3, 4) and arr.shape[0] not in (3, 4)):
+            return arr, "static", path.stem
+        return arr, "video", path.stem
+
+    if suffix in (".h5", ".hdf5"):
+        return _load_hdf5_any(path, path.stem)
+
+    raise LoadError(f"Unsupported overlay file extension: {suffix}")
+
+
+def _load_static_image(path: Path) -> np.ndarray:
+    """Load a single 2D image via imageio."""
+    import imageio.v3 as iio
+
+    arr = np.asarray(iio.imread(str(path)))
+    if arr.ndim not in (2, 3):
+        raise LoadError(f"Unsupported image shape {arr.shape} in {path}")
+    return arr
+
+
+def _load_tiff_any(path: Path) -> np.ndarray:
+    """Read TIFF as-is (no T>=2 constraint), preferring memmap for large files."""
+    import tifffile
+
+    try:
+        return tifffile.memmap(path, mode="r")
+    except (ValueError, OSError):
+        return tifffile.imread(path)
+
+
+def _load_hdf5_any(path: Path, name: str) -> tuple[Any, str, str]:
+    """Try video dataset first; fall back to single-image dataset."""
+    f = h5py.File(path, "r")
+    video_ds = _find_video_dataset(f)
+    if video_ds is not None:
+        chunks = (1,) + video_ds.shape[1:]
+        return da.from_array(video_ds, chunks=chunks), "video", name
+
+    image_ds = _find_image_dataset(f)
+    if image_ds is not None:
+        arr = np.asarray(image_ds[:])
+        f.close()
+        if arr.ndim == 3 and arr.shape[0] == 1 and arr.shape[-1] not in (3, 4):
+            arr = arr[0]
+        return arr, "static", name
+
+    f.close()
+    raise LoadError(f"No image/video dataset found in {path}")
+
+
 def _load_tiff(path: Path) -> Any:
     """Load a multi-page TIFF stack. Uses memory-mapping when possible so
     huge files (>>RAM) don't load entirely into memory."""
