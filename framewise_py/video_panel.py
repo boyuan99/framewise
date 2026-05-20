@@ -26,6 +26,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMenu,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -258,16 +260,58 @@ class VideoPanel(QWidget):
         self.btn_add_overlay.clicked.connect(self._on_add_overlay_clicked)
         controls.addWidget(self.btn_add_overlay)
 
-        layout.addLayout(controls)
+        # The control row's combined minimum width (~600px) would otherwise pin
+        # the panel's — and therefore the MDI sub-window's — minimum width,
+        # blocking narrow resizes. Put it in a horizontally-scrollable strip with
+        # a zero minimum width so the panel can shrink freely; controls scroll
+        # when the panel is narrower than they are.
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls_widget = QWidget()
+        controls_widget.setLayout(controls)
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidget(controls_widget)
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        controls_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        controls_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        controls_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        controls_scroll.setMinimumWidth(0)
+        controls_scroll.setFixedHeight(controls_widget.sizeHint().height() + 16)
+        layout.addWidget(controls_scroll)
 
-        # Overlays section — hidden until first overlay is added.
+        # Overlays section — hidden until first overlay is added. Wrapped in a
+        # scrollable strip (same reason as the controls row) so wide overlay
+        # rows don't pin the panel's minimum width; tall stacks scroll instead
+        # of stealing the image's vertical space.
         self._overlays_frame = QFrame()
         self._overlays_frame.setFrameShape(QFrame.Shape.StyledPanel)
         self._overlays_layout = QVBoxLayout(self._overlays_frame)
         self._overlays_layout.setContentsMargins(2, 2, 2, 2)
         self._overlays_layout.setSpacing(1)
-        self._overlays_frame.setVisible(False)
-        layout.addWidget(self._overlays_frame)
+
+        self._overlays_scroll = QScrollArea()
+        self._overlays_scroll.setWidget(self._overlays_frame)
+        self._overlays_scroll.setWidgetResizable(True)
+        self._overlays_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._overlays_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._overlays_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._overlays_scroll.setMinimumWidth(0)
+        self._overlays_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
+        self._overlays_scroll.setMaximumHeight(220)
+        self._overlays_scroll.setVisible(False)
+        layout.addWidget(self._overlays_scroll)
 
         # Apply default colormap (gray) so explicit changes via the combo box
         # always go through the same code path.
@@ -419,7 +463,7 @@ class VideoPanel(QWidget):
         ov.row = widget
         self._overlays.append(ov)
         self._overlays_layout.addWidget(widget)
-        self._overlays_frame.setVisible(True)
+        self._overlays_scroll.setVisible(True)
 
         # Initial render + LUT.
         self._apply_overlay_colormap(ov)
@@ -446,7 +490,7 @@ class VideoPanel(QWidget):
             ov.hist_dialog.deleteLater()
             ov.hist_dialog = None
         if not self._overlays:
-            self._overlays_frame.setVisible(False)
+            self._overlays_scroll.setVisible(False)
         self.overlay_removed.emit(self)
 
     def set_overlay_visible(self, index: int, visible: bool) -> None:

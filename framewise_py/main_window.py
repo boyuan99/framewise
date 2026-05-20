@@ -19,6 +19,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QStackedWidget,
+    QTabBar,
     QToolBar,
     QVBoxLayout,
 )
@@ -27,7 +29,7 @@ from .console_panel import ConsolePanel, JupyterLabLauncher
 from .master_clock import MasterClock
 from .namespace import CoreNamespaceProvider
 from .notebook_panel import WEBENGINE_AVAILABLE, NotebookPanel
-from .panels import PanelManager
+from .panels import PanelManager, VideoGrid
 from .settings import get_last_dir, set_last_dir_from_path, settings
 from .sync import FILE_FILTER, ResourceManagerPanel, SyncController
 
@@ -50,14 +52,17 @@ class MainWindow(QMainWindow):
         self.resize(1400, 900)
         self.setDockNestingEnabled(True)
 
-        placeholder = QLabel("Drop videos here or use File → Open")
-        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        placeholder.setStyleSheet("color: #888;")
-        self.setCentralWidget(placeholder)
-
         self.master_clock = MasterClock(self)
 
-        self.panel_manager = PanelManager(self, master_clock=self.master_clock)
+        # Central area is a 2-page stack: the video grid and the embedded
+        # notebook. Both stay alive simultaneously; the workspace tabs just
+        # switch which page is shown (video playback and the kernel/Lab keep
+        # running on the hidden page).
+        self.video_grid = VideoGrid()
+        self._central_stack = QStackedWidget()
+        self._central_stack.addWidget(self.video_grid)  # page 0 — Video
+
+        self.panel_manager = PanelManager(self.video_grid, master_clock=self.master_clock)
         self.sync_controller = SyncController()
 
         self.sync_panel = ResourceManagerPanel(self.sync_controller, self.panel_manager)
@@ -83,26 +88,29 @@ class MainWindow(QMainWindow):
             self.console_panel.external_connection_dir
         )
 
-        # Embedded Jupyter Lab dock (only if PyQt6-WebEngine is installed).
+        # Notebook = page 1 of the central stack (embedded Lab if PyQt6-WebEngine
+        # is installed; otherwise a hint pointing at the external-browser flow).
         self.notebook_panel = None
-        self.notebook_dock = None
         if WEBENGINE_AVAILABLE:
             self.notebook_panel = NotebookPanel(self)
-            self.notebook_dock = QDockWidget("Notebook", self)
-            self.notebook_dock.setObjectName("notebook_dock")
-            self.notebook_dock.setWidget(self.notebook_panel)
-            self.notebook_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
-            self.addDockWidget(
-                Qt.DockWidgetArea.BottomDockWidgetArea, self.notebook_dock
+            self._central_stack.addWidget(self.notebook_panel)  # page 1
+        else:
+            hint = QLabel(
+                "Embedded Jupyter Lab needs PyQt6-WebEngine.\n"
+                'Install with:  pip install -e ".[notebook]"\n\n'
+                "Or use View → Open in external browser to run Lab in your browser."
             )
-            self.tabifyDockWidget(self.console_dock, self.notebook_dock)
-            self.notebook_dock.hide()
+            hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            hint.setStyleSheet("color: #888;")
+            self._central_stack.addWidget(hint)  # page 1
 
-        # Keep the console namespace current as panels come and go (matters for
-        # out-of-process mode, whose namespace is a snapshot of picklable stubs;
-        # same-process resolves panels live so the re-push is a harmless no-op).
-        self.panel_manager.on_added(lambda *_: self._refresh_console_namespace())
-        self.panel_manager.on_removed(lambda *_: self._refresh_console_namespace())
+        self.setCentralWidget(self._central_stack)
+
+        self.panel_manager.on_added(self._on_panel_added)
+        self.panel_manager.on_removed(self._on_panel_removed)
+
+        # Workspace = which central page is shown (Video grid vs Notebook).
+        self._ws_tabbar: QTabBar | None = None
 
         # Playback timer — advances master_clock by real elapsed wall time so
         # playback stays at true speed even if rendering can't keep up with
@@ -115,7 +123,10 @@ class MainWindow(QMainWindow):
 
         self._build_menus()
         self._build_toolbar()
+        self._build_workspace_bar()
         self._restore_settings()
+        # Start in the Video workspace with a freshly built default layout.
+        self._set_workspace("Video")
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -173,6 +184,20 @@ class MainWindow(QMainWindow):
         act_conn = QAction("Show &connection info…", self)
         act_conn.triggered.connect(self._show_connection_info)
         view_menu.addAction(act_conn)
+
+        view_menu.addSeparator()
+
+        act_tile = QAction("&Tile Videos", self)
+        act_tile.triggered.connect(lambda: self.video_grid.tile())
+        view_menu.addAction(act_tile)
+
+        act_cascade = QAction("Ca&scade Videos", self)
+        act_cascade.triggered.connect(lambda: self.video_grid.cascade())
+        view_menu.addAction(act_cascade)
+
+        act_reset = QAction("&Reset Layout", self)
+        act_reset.triggered.connect(self._reset_layout)
+        view_menu.addAction(act_reset)
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Playback", self)
@@ -271,8 +296,8 @@ class MainWindow(QMainWindow):
         self.console_panel.refresh_namespace()
 
     def _open_jupyter_lab(self) -> None:
-        """Open Lab embedded in the Notebook dock if WebEngine is available,
-        otherwise fall back to the system browser."""
+        """Switch to the Notebook workspace (embedded Lab). Falls back to the
+        system browser if PyQt6-WebEngine isn't installed."""
         if self.notebook_panel is None:
             QMessageBox.information(
                 self,
@@ -283,12 +308,8 @@ class MainWindow(QMainWindow):
             )
             self._open_jupyter_lab_browser()
             return
-
-        url = self.jupyter_launcher.start(embedded=True)
-        self.act_stop_lab.setEnabled(True)
-        self.notebook_dock.show()
-        self.notebook_dock.raise_()
-        self.notebook_panel.load(url)
+        # _set_workspace("Notebook") shows the page and starts Lab on first use.
+        self._set_workspace("Notebook")
 
     def _open_jupyter_lab_browser(self) -> None:
         self.jupyter_launcher.start(embedded=False)
@@ -308,7 +329,8 @@ class MainWindow(QMainWindow):
         self.act_stop_lab.setEnabled(False)
         if self.notebook_panel is not None:
             self.notebook_panel.clear()
-            self.notebook_dock.hide()
+        # Drop back to the video workspace now that the notebook is empty.
+        self._set_workspace("Video")
 
     def _show_connection_info(self) -> None:
         info = self.console_panel.connection_info()
@@ -342,21 +364,72 @@ class MainWindow(QMainWindow):
         dlg.resize(560, 260)
         dlg.show()
 
+    # ----- Workspaces & layout -----
+
+    def _build_workspace_bar(self) -> None:
+        self._ws_tabbar = QTabBar()
+        self._ws_tabbar.addTab("Video")
+        self._ws_tabbar.addTab("Notebook")
+        # Connect after addTab so the initial population doesn't fire a switch;
+        # __init__ calls _set_workspace("Video") explicitly to build it.
+        self._ws_tabbar.currentChanged.connect(self._on_ws_tab_changed)
+        bar = QToolBar("Workspace", self)
+        bar.setObjectName("workspace_toolbar")
+        bar.setMovable(False)
+        bar.addWidget(self._ws_tabbar)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, bar)
+
+    def _on_ws_tab_changed(self, index: int) -> None:
+        self._set_workspace("Video" if index == 0 else "Notebook")
+
+    def _set_workspace(self, name: str) -> None:
+        """Switch the central page. Video grid and notebook both stay alive;
+        this only changes which is shown."""
+        index = 0 if name == "Video" else 1
+        if self._ws_tabbar is not None and self._ws_tabbar.currentIndex() != index:
+            self._ws_tabbar.blockSignals(True)
+            self._ws_tabbar.setCurrentIndex(index)
+            self._ws_tabbar.blockSignals(False)
+        self._central_stack.setCurrentIndex(index)
+        if name == "Notebook":
+            self._ensure_notebook_ready()
+
+    def _ensure_notebook_ready(self) -> None:
+        """Start the embedded Lab on first entry to the Notebook workspace."""
+        if self.notebook_panel is None:
+            return
+        if not self.jupyter_launcher.is_running():
+            url = self.jupyter_launcher.start(embedded=True)
+            self.act_stop_lab.setEnabled(True)
+            self.notebook_panel.load(url)
+
+    def _reset_layout(self) -> None:
+        # Re-show the auxiliary docks and return to the Video workspace.
+        self.sync_dock.show()
+        self.console_dock.hide()
+        self._set_workspace("Video")
+
+    def _on_panel_added(self, entry) -> None:
+        self._refresh_console_namespace()
+        # A freshly loaded video should be visible: jump to the Video workspace.
+        self._set_workspace("Video")
+
+    def _on_panel_removed(self, entry) -> None:
+        self._refresh_console_namespace()
+
     # ----- Persistence -----
 
     def _restore_settings(self) -> None:
+        # Only restore window size/position. Dock layout is driven by the
+        # workspace system (built fresh each launch), not a single saved state.
         s = settings()
         geom = s.value("geometry")
         if geom is not None:
             self.restoreGeometry(geom)
-        state = s.value("windowState")
-        if state is not None:
-            self.restoreState(state)
 
     def _save_settings(self) -> None:
         s = settings()
         s.setValue("geometry", self.saveGeometry())
-        s.setValue("windowState", self.saveState())
 
     def closeEvent(self, event) -> None:
         self._save_settings()

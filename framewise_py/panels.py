@@ -1,14 +1,26 @@
-"""Manages VideoPanel and SignalPanel dock widgets in the main window."""
+"""Central video/signal grid + the manager that owns the loaded panels.
+
+Panels live in a central tiled grid (nested QSplitters) rather than as floating
+dock widgets, so the video area fills the window and resizes freely, and so the
+video grid can be one page of the main window's workspace stack (the other page
+being the embedded notebook) — letting videos and notebook coexist while a tab
+switches which is in view.
+"""
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Union
+from typing import Callable, Union
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QDockWidget, QMainWindow, QWidget
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QLabel,
+    QMdiArea,
+    QMdiSubWindow,
+    QStackedLayout,
+    QWidget,
+)
 
 from .loaders import is_tdt_path, load, load_tdt
 from .master_clock import MasterClock
@@ -21,26 +33,88 @@ AnyPanel = Union[VideoPanel, SignalPanel]
 @dataclass
 class PanelEntry:
     panel: AnyPanel
-    dock: QDockWidget
     path: Path
     kind: str  # "video" or "signal"
 
 
+class _VideoSubWindow(QMdiSubWindow):
+    """A loaded panel as a free-floating MDI sub-window: drag the title bar to
+    move, drag edges to resize, native min/max/close — all bounded to the MDI
+    area. Closing it routes through `on_close` (the manager) like the old dock
+    X button did."""
+
+    def __init__(
+        self, entry: PanelEntry, on_close: Callable[[PanelEntry], None]
+    ) -> None:
+        super().__init__()
+        self.entry = entry
+        self.setWidget(entry.panel)
+        self.setWindowTitle(f"[{entry.kind}] {entry.panel.name}")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.resize(480, 360)
+        # destroyed (after the X deletes it) drives manager cleanup, mirroring
+        # the previous dock.destroyed wiring.
+        self.destroyed.connect(lambda *_: on_close(entry))
+
+
+class VideoGrid(QWidget):
+    """Central widget hosting loaded panels as free-floating MDI sub-windows
+    inside a bounded area. Switching the workspace away and back never destroys
+    these (they live here permanently until closed), so videos persist."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._subs: list[_VideoSubWindow] = []
+
+        self._stack = QStackedLayout(self)
+
+        self._placeholder = QLabel("Drop videos here or use File → Open")
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._placeholder.setStyleSheet("color: #888;")
+
+        self._mdi = QMdiArea()
+
+        self._stack.addWidget(self._placeholder)  # index 0 — empty state
+        self._stack.addWidget(self._mdi)  # index 1 — MDI area
+        self._update_view()
+
+    def add_panel(
+        self, entry: PanelEntry, on_close: Callable[[PanelEntry], None]
+    ) -> None:
+        sub = _VideoSubWindow(entry, on_close)
+        self._subs.append(sub)
+        self._mdi.addSubWindow(sub)
+        sub.show()
+        self._update_view()
+
+    def remove_panel(self, entry: PanelEntry) -> None:
+        # The sub-window self-deletes (WA_DeleteOnClose); just drop bookkeeping.
+        self._subs = [s for s in self._subs if s.entry is not entry]
+        self._update_view()
+
+    def tile(self) -> None:
+        self._mdi.tileSubWindows()
+
+    def cascade(self) -> None:
+        self._mdi.cascadeSubWindows()
+
+    def _update_view(self) -> None:
+        self._stack.setCurrentIndex(1 if self._subs else 0)
+
+
 class PanelManager:
-    """Owns the list of dock widgets and handles grid layout.
+    """Owns the list of loaded panels and routes them into the VideoGrid.
 
     If a MasterClock is passed at construction, every new panel auto-binds
     to it for frame-lock.
     """
 
-    panel_added = pyqtSignal  # placeholder; callbacks used instead
-
     def __init__(
         self,
-        main_window: QMainWindow,
+        grid: VideoGrid,
         master_clock: MasterClock | None = None,
     ) -> None:
-        self._main_window = main_window
+        self._grid = grid
         self._master_clock = master_clock
         self._entries: list[PanelEntry] = []
         self._on_added_callbacks: list = []
@@ -89,50 +163,13 @@ class PanelManager:
         if self._master_clock is not None:
             panel.bind_master_clock(self._master_clock)
 
-        dock = QDockWidget(name, self._main_window)
-        dock.setWidget(panel)
-        dock.setObjectName(f"{kind}_{len(self._entries)}_{name}")
-        dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
-        # X button truly deletes the dock (default would only hide it), so the
-        # destroyed-signal chain below fires and SyncController + UI clean up.
-        dock.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-
-        entry = PanelEntry(panel=panel, dock=dock, path=path, kind=kind)
+        entry = PanelEntry(panel=panel, path=path, kind=kind)
         self._entries.append(entry)
-        self._place_in_grid(entry)
-
-        dock.destroyed.connect(lambda *_: self._remove_entry(entry))
+        self._grid.add_panel(entry, self._remove_entry)
 
         for cb in self._on_added_callbacks:
             cb(entry)
         return entry
-
-    def _place_in_grid(self, new_entry: PanelEntry) -> None:
-        """Place the new dock so all open panels form a roughly square grid."""
-        mw = self._main_window
-        if len(self._entries) == 1:
-            mw.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, new_entry.dock)
-            return
-
-        n = len(self._entries)
-        cols = math.ceil(math.sqrt(n))
-        idx = n - 1
-        row, col = divmod(idx, cols)
-
-        if row == 0:
-            mw.splitDockWidget(
-                self._entries[idx - 1].dock,
-                new_entry.dock,
-                Qt.Orientation.Horizontal,
-            )
-        else:
-            above_idx = (row - 1) * cols + col
-            anchor_idx = above_idx if above_idx < idx else idx - 1
-            mw.splitDockWidget(
-                self._entries[anchor_idx].dock,
-                new_entry.dock,
-                Qt.Orientation.Vertical,
-            )
 
     def _remove_entry(self, entry: PanelEntry) -> None:
         if entry not in self._entries:
@@ -140,3 +177,4 @@ class PanelManager:
         self._entries.remove(entry)
         for cb in self._on_removed_callbacks:
             cb(entry)
+        self._grid.remove_panel(entry)
