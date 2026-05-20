@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 from .console_panel import ConsolePanel, JupyterLabLauncher
 from .master_clock import MasterClock
 from .namespace import CoreNamespaceProvider
+from .notebook_panel import WEBENGINE_AVAILABLE, NotebookPanel
 from .panels import PanelManager
 from .settings import get_last_dir, set_last_dir_from_path, settings
 from .sync import FILE_FILTER, ResourceManagerPanel, SyncController
@@ -81,6 +82,21 @@ class MainWindow(QMainWindow):
         self.jupyter_launcher = JupyterLabLauncher(
             self.console_panel.external_connection_dir
         )
+
+        # Embedded Jupyter Lab dock (only if PyQt6-WebEngine is installed).
+        self.notebook_panel = None
+        self.notebook_dock = None
+        if WEBENGINE_AVAILABLE:
+            self.notebook_panel = NotebookPanel(self)
+            self.notebook_dock = QDockWidget("Notebook", self)
+            self.notebook_dock.setObjectName("notebook_dock")
+            self.notebook_dock.setWidget(self.notebook_panel)
+            self.notebook_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+            self.addDockWidget(
+                Qt.DockWidgetArea.BottomDockWidgetArea, self.notebook_dock
+            )
+            self.tabifyDockWidget(self.console_dock, self.notebook_dock)
+            self.notebook_dock.hide()
 
         # Keep the console namespace current as panels come and go (matters for
         # out-of-process mode, whose namespace is a snapshot of picklable stubs;
@@ -144,6 +160,10 @@ class MainWindow(QMainWindow):
         self.act_open_lab = QAction("&Open in Jupyter Lab", self)
         self.act_open_lab.triggered.connect(self._open_jupyter_lab)
         view_menu.addAction(self.act_open_lab)
+
+        self.act_open_lab_browser = QAction("Open in external &browser…", self)
+        self.act_open_lab_browser.triggered.connect(self._open_jupyter_lab_browser)
+        view_menu.addAction(self.act_open_lab_browser)
 
         self.act_stop_lab = QAction("S&top Jupyter Lab", self)
         self.act_stop_lab.setEnabled(False)
@@ -251,30 +271,44 @@ class MainWindow(QMainWindow):
         self.console_panel.refresh_namespace()
 
     def _open_jupyter_lab(self) -> None:
-        started = self.jupyter_launcher.start()
+        """Open Lab embedded in the Notebook dock if WebEngine is available,
+        otherwise fall back to the system browser."""
+        if self.notebook_panel is None:
+            QMessageBox.information(
+                self,
+                "Jupyter Lab",
+                "Embedded Lab needs PyQt6-WebEngine. Install it with:\n"
+                '  pip install -e ".[notebook]"\n\n'
+                "Opening in your system browser instead.",
+            )
+            self._open_jupyter_lab_browser()
+            return
+
+        url = self.jupyter_launcher.start(embedded=True)
+        self.act_stop_lab.setEnabled(True)
+        self.notebook_dock.show()
+        self.notebook_dock.raise_()
+        self.notebook_panel.load(url)
+
+    def _open_jupyter_lab_browser(self) -> None:
+        self.jupyter_launcher.start(embedded=False)
         self.act_stop_lab.setEnabled(True)
         kid = self.console_panel.connection_info()["kernel_id"]
-        if started:
-            QMessageBox.information(
-                self,
-                "Jupyter Lab",
-                "Jupyter Lab is starting and will open in your browser.\n\n"
-                "In a new Notebook/Console, choose the kernel:\n"
-                f"  Connect to Existing → {kid}\n\n"
-                "Stopping Jupyter Lab (View → Stop Jupyter Lab) will NOT kill "
-                "this kernel; framewise keeps owning it.",
-            )
-        else:
-            QMessageBox.information(
-                self,
-                "Jupyter Lab",
-                "Jupyter Lab is already running. Look for the existing browser "
-                f"tab, then connect to existing kernel:\n  {kid}",
-            )
+        QMessageBox.information(
+            self,
+            "Jupyter Lab",
+            "Jupyter Lab is starting in your browser.\n\n"
+            "In a new Notebook/Console, choose the kernel:\n"
+            f"  Connect to Existing → {kid}\n\n"
+            "Stopping Jupyter Lab will NOT kill this kernel; framewise owns it.",
+        )
 
     def _stop_jupyter_lab(self) -> None:
         self.jupyter_launcher.stop()
         self.act_stop_lab.setEnabled(False)
+        if self.notebook_panel is not None:
+            self.notebook_panel.clear()
+            self.notebook_dock.hide()
 
     def _show_connection_info(self) -> None:
         info = self.console_panel.connection_info()

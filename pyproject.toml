@@ -18,6 +18,9 @@ dependencies = [
     "jupyter-client>=8.0",
 ]
 
+[project.optional-dependencies]
+notebook = ["PyQt6-WebEngine>=6.6"]
+
 [project.scripts]
 framewise = "framewise_py.main:main"
 

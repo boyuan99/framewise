@@ -462,47 +462,100 @@ class JupyterLabLauncher:
     """Starts/stops a `jupyter lab` subprocess configured to discover
     framewise's kernel via the external-connection-dir mechanism.
 
+    Two launch modes:
+    * embedded — headless server on a known port+token; the URL is returned so
+      a QWebEngineView can load it inside framewise.
+    * external — lets jupyter open the system browser (the original behavior).
+
     Stopping Lab does NOT kill framewise's kernel: the server adopts it with
-    owns_kernel=False, so terminating the server only closes the browser host."""
+    owns_kernel=False, so terminating the server only closes the host."""
 
     def __init__(self, external_connection_dir: str) -> None:
         self._dir = external_connection_dir
         self._proc = None
+        self._url: Optional[str] = None
+
+    @property
+    def url(self) -> Optional[str]:
+        return self._url
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def start(self) -> bool:
-        """Launch Jupyter Lab (opens a browser). Returns False if it was
-        already running (caller may want to surface its URL again)."""
+    @staticmethod
+    def _free_port() -> int:
+        import socket
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def start(self, embedded: bool = True) -> Optional[str]:
+        """Launch Jupyter Lab. In embedded mode returns the URL (with token) to
+        load in a QWebEngineView; in external mode opens the system browser and
+        returns None. If already running, returns the current URL unchanged."""
+        import secrets
         import subprocess
         import sys
 
         if self.is_running():
-            return False
-        self._proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "jupyterlab",
-                "--ServerApp.allow_external_kernels=True",
-                f"--ServerApp.external_connection_dir={self._dir}",
+            return self._url
+
+        common = [
+            "--ServerApp.allow_external_kernels=True",
+            f"--ServerApp.external_connection_dir={self._dir}",
+        ]
+        if embedded:
+            port = self._free_port()
+            token = secrets.token_hex(16)
+            args = common + [
+                "--no-browser",
+                f"--ServerApp.port={port}",
+                "--ServerApp.port_retries=0",
+                f"--IdentityProvider.token={token}",
             ]
+            self._url = f"http://127.0.0.1:{port}/lab?token={token}"
+        else:
+            args = common
+            self._url = None
+
+        self._proc = subprocess.Popen(
+            [sys.executable, "-m", "jupyterlab", *args]
         )
-        return True
+        return self._url
 
     def stop(self) -> None:
+        import sys
+
         if not self.is_running():
             self._proc = None
+            self._url = None
             return
         proc = self._proc
         try:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except Exception:
-                proc.kill()
+            if sys.platform == "win32":
+                # Headless server has no window to close; kill the whole tree so
+                # nothing is left running invisibly.
+                import subprocess
+
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                )
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
+            else:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    proc.kill()
         except Exception:
             pass
         finally:
             self._proc = None
+            self._url = None

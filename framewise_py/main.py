@@ -24,6 +24,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # QtWebEngine (the embedded Jupyter Lab dock) requires shared OpenGL
+    # contexts to be enabled before the QApplication is created. Harmless when
+    # WebEngine isn't installed.
+    try:
+        from PyQt6.QtCore import Qt
+
+        QApplication.setAttribute(
+            Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True
+        )
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
