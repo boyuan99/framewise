@@ -141,6 +141,12 @@ class VideoPanel(QWidget):
         return self._name
 
     @property
+    def array(self):
+        """Underlying (often lazy) frame array, shape (T, H, W[, C]). Exposed
+        for the embedded console so users can compute on raw frames."""
+        return self._array
+
+    @property
     def current_frame(self) -> int:
         return self._current_frame
 

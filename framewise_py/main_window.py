@@ -7,18 +7,25 @@ import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
 from PyQt6.QtWidgets import (
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
     QToolBar,
+    QVBoxLayout,
 )
 
+from .console_panel import ConsolePanel, JupyterLabLauncher
 from .master_clock import MasterClock
+from .namespace import CoreNamespaceProvider
 from .panels import PanelManager
 from .settings import get_last_dir, set_last_dir_from_path, settings
 from .sync import FILE_FILTER, ResourceManagerPanel, SyncController
@@ -61,6 +68,26 @@ class MainWindow(QMainWindow):
         self.sync_dock.setObjectName("sync_manager")
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.sync_dock)
 
+        # Console: ordered list of namespace providers (Phase 2 ROI subsystem
+        # appends its own). The factory merges them in registration order.
+        self._namespace_providers = [CoreNamespaceProvider(self)]
+        self.console_panel = ConsolePanel(self._collect_namespace, parent=self)
+        self.console_dock = QDockWidget("Console", self)
+        self.console_dock.setObjectName("console_dock")
+        self.console_dock.setWidget(self.console_panel)
+        self.console_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.console_dock)
+
+        self.jupyter_launcher = JupyterLabLauncher(
+            self.console_panel.external_connection_dir
+        )
+
+        # Keep the console namespace current as panels come and go (matters for
+        # out-of-process mode, whose namespace is a snapshot of picklable stubs;
+        # same-process resolves panels live so the re-push is a harmless no-op).
+        self.panel_manager.on_added(lambda *_: self._refresh_console_namespace())
+        self.panel_manager.on_removed(lambda *_: self._refresh_console_namespace())
+
         # Playback timer — advances master_clock by real elapsed wall time so
         # playback stays at true speed even if rendering can't keep up with
         # PLAYBACK_TICK_MS (in which case we skip frames rather than slow down).
@@ -88,6 +115,44 @@ class MainWindow(QMainWindow):
         act_quit.setShortcut("Ctrl+Q")
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_quit)
+
+        view_menu = self.menuBar().addMenu("&View")
+
+        toggle_console = self.console_dock.toggleViewAction()
+        toggle_console.setText("&Console")
+        toggle_console.setShortcut("Ctrl+`")
+        view_menu.addAction(toggle_console)
+        view_menu.addAction(self.sync_dock.toggleViewAction())
+
+        view_menu.addSeparator()
+
+        kernel_menu = view_menu.addMenu("Console &kernel")
+        self._kernel_mode_group = QActionGroup(self)
+        self._kernel_mode_group.setExclusive(True)
+        for label, mode in [
+            ("&Same-process (shared live objects)", "same_process"),
+            ("&Out-of-process (heavy compute)", "out_of_process"),
+        ]:
+            act = QAction(label, self, checkable=True)
+            act.setChecked(mode == self.console_panel.mode)
+            act.triggered.connect(lambda _checked, m=mode: self._switch_kernel(m))
+            self._kernel_mode_group.addAction(act)
+            kernel_menu.addAction(act)
+
+        view_menu.addSeparator()
+
+        self.act_open_lab = QAction("&Open in Jupyter Lab", self)
+        self.act_open_lab.triggered.connect(self._open_jupyter_lab)
+        view_menu.addAction(self.act_open_lab)
+
+        self.act_stop_lab = QAction("S&top Jupyter Lab", self)
+        self.act_stop_lab.setEnabled(False)
+        self.act_stop_lab.triggered.connect(self._stop_jupyter_lab)
+        view_menu.addAction(self.act_stop_lab)
+
+        act_conn = QAction("Show &connection info…", self)
+        act_conn.triggered.connect(self._show_connection_info)
+        view_menu.addAction(act_conn)
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Playback", self)
@@ -171,6 +236,78 @@ class MainWindow(QMainWindow):
         self._last_tick = now
         self.master_clock.set_time(self.master_clock.time + dt * self._playback_speed)
 
+    # ----- Console -----
+
+    def _collect_namespace(self, host) -> dict:
+        ns: dict = {}
+        for provider in self._namespace_providers:
+            ns.update(provider.collect(host))
+        return ns
+
+    def _switch_kernel(self, mode: str) -> None:
+        self.console_panel.switch_to(mode)
+
+    def _refresh_console_namespace(self) -> None:
+        self.console_panel.refresh_namespace()
+
+    def _open_jupyter_lab(self) -> None:
+        started = self.jupyter_launcher.start()
+        self.act_stop_lab.setEnabled(True)
+        kid = self.console_panel.connection_info()["kernel_id"]
+        if started:
+            QMessageBox.information(
+                self,
+                "Jupyter Lab",
+                "Jupyter Lab is starting and will open in your browser.\n\n"
+                "In a new Notebook/Console, choose the kernel:\n"
+                f"  Connect to Existing → {kid}\n\n"
+                "Stopping Jupyter Lab (View → Stop Jupyter Lab) will NOT kill "
+                "this kernel; framewise keeps owning it.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Jupyter Lab",
+                "Jupyter Lab is already running. Look for the existing browser "
+                f"tab, then connect to existing kernel:\n  {kid}",
+            )
+
+    def _stop_jupyter_lab(self) -> None:
+        self.jupyter_launcher.stop()
+        self.act_stop_lab.setEnabled(False)
+
+    def _show_connection_info(self) -> None:
+        info = self.console_panel.connection_info()
+        text = (
+            f"Kernel mode: {info['mode']}\n"
+            f"Kernel ID:   {info['kernel_id']}\n"
+            f"Connection:  {info['connection_file']}\n"
+            f"External dir: {info['external_connection_dir']}\n\n"
+            "Easiest: View → Open in Jupyter Lab (auto-configures discovery).\n\n"
+            "Manual launch (equivalent):\n"
+            "  jupyter lab --ServerApp.allow_external_kernels=True \\\n"
+            f"    --ServerApp.external_connection_dir=\"{info['external_connection_dir']}\"\n\n"
+            "Then New Console/Notebook → Connect to Existing python Kernel →\n"
+            f"  {info['kernel_id']}"
+        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Console connection info")
+        dlg.setModal(False)
+        layout = QVBoxLayout(dlg)
+        view = QPlainTextEdit(text)
+        view.setReadOnly(True)
+        layout.addWidget(view)
+        copy_btn = QPushButton("Copy connection file path")
+        copy_btn.clicked.connect(
+            lambda: QGuiApplication.clipboard().setText(info["connection_file"])
+        )
+        layout.addWidget(copy_btn)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dlg.close)
+        layout.addWidget(buttons)
+        dlg.resize(560, 260)
+        dlg.show()
+
     # ----- Persistence -----
 
     def _restore_settings(self) -> None:
@@ -189,4 +326,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_settings()
+        try:
+            self.jupyter_launcher.stop()
+        except Exception:
+            pass
+        try:
+            self.console_panel.shutdown()
+        except Exception:
+            pass
         super().closeEvent(event)
