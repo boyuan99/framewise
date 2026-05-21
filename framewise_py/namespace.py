@@ -143,3 +143,73 @@ class CoreNamespaceProvider:
             "np": np,
             "pg": pg,
         }
+
+
+class RoiNamespaceProvider:
+    """Phase 2: exposes drawn ROIs, their masks, and extracted ΔF/F traces to
+    the console / embedded Jupyter Lab.
+
+    ROIs are live Qt objects (and masks are computed from live geometry), so
+    these helpers only work with the in-process kernel. In out-of-process mode
+    nothing is injected — switch View → Console kernel → Same-process.
+    """
+
+    def __init__(self, window: "MainWindow") -> None:
+        self._window = window
+
+    def collect(self, host: "KernelHost") -> dict[str, Any]:
+        if not host.is_same_process:
+            return {}
+
+        from .roi import ellipse_mask
+
+        w = self._window
+
+        def _videos() -> dict:
+            return {
+                e.panel.name: e.panel
+                for e in w.panel_manager.entries
+                if e.kind == "video"
+            }
+
+        def _require(video: str):
+            vids = _videos()
+            if video not in vids:
+                raise KeyError(f"No video named {video!r}. Available: {list(vids)}")
+            return vids[video]
+
+        def rois(video: str | None = None):
+            """ROI items. With no arg: {video_name: [RoiItem, ...]}; with a
+            video name: that video's list of RoiItem (each has .id .name
+            .color .roi …)."""
+            if video is None:
+                return {name: list(p.rois) for name, p in _videos().items()}
+            return list(_require(video).rois)
+
+        def roi_masks(video: str):
+            """{roi_name: bool ndarray (H, W)} computed from current geometry."""
+            p = _require(video)
+            hw = p.frame_hw
+            return {
+                it.name: ellipse_mask(
+                    it.roi.pos(), it.roi.size(), it.roi.angle(), hw
+                )
+                for it in p.rois
+            }
+
+        def roi_dff(video: str | None = None):
+            """Most recently extracted ΔF/F. With no arg: {video_name:
+            {roi_name: ndarray}}; with a video name: {roi_name: ndarray}.
+            Empty until you run Extract ΔF/F for that video."""
+            panels = getattr(w, "_roi_trace_panels", {})
+            live = w.panel_manager.entries
+
+            def arrays(entry):
+                return entry.panel.trace_arrays() if entry in live else {}
+
+            if video is None:
+                return {name: arrays(e) for name, e in panels.items()}
+            entry = panels.get(video)
+            return arrays(entry) if entry is not None else {}
+
+        return {"rois": rois, "roi_masks": roi_masks, "roi_dff": roi_dff}

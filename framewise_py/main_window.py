@@ -27,10 +27,11 @@ from PyQt6.QtWidgets import (
 
 from .console_panel import ConsolePanel, JupyterLabLauncher
 from .master_clock import MasterClock
-from .namespace import CoreNamespaceProvider
+from .namespace import CoreNamespaceProvider, RoiNamespaceProvider
 from .notebook_panel import WEBENGINE_AVAILABLE, NotebookPanel
 from .panels import PanelManager, VideoGrid
 from .settings import get_last_dir, set_last_dir_from_path, settings
+from .signal_panel import SignalPanel
 from .sync import FILE_FILTER, ResourceManagerPanel, SyncController
 
 # QTimer interval for playback ticks. 33ms ≈ 30Hz, smooth enough for any video
@@ -76,13 +77,18 @@ class MainWindow(QMainWindow):
 
         # Console: ordered list of namespace providers (Phase 2 ROI subsystem
         # appends its own). The factory merges them in registration order.
-        self._namespace_providers = [CoreNamespaceProvider(self)]
+        self._namespace_providers = [
+            CoreNamespaceProvider(self),
+            RoiNamespaceProvider(self),
+        ]
         self.console_panel = ConsolePanel(self._collect_namespace, parent=self)
         self.console_dock = QDockWidget("Console", self)
         self.console_dock.setObjectName("console_dock")
         self.console_dock.setWidget(self.console_panel)
         self.console_dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.console_dock)
+        # Hidden by default — show it via View → Console (Ctrl+`) when needed.
+        self.console_dock.hide()
 
         self.jupyter_launcher = JupyterLabLauncher(
             self.console_panel.external_connection_dir
@@ -108,6 +114,9 @@ class MainWindow(QMainWindow):
 
         self.panel_manager.on_added(self._on_panel_added)
         self.panel_manager.on_removed(self._on_panel_removed)
+
+        # One dedicated ΔF/F signal panel per source video, keyed by video name.
+        self._roi_trace_panels: dict = {}
 
         # Workspace = which central page is shown (Video grid vs Notebook).
         self._ws_tabbar: QTabBar | None = None
@@ -411,11 +420,35 @@ class MainWindow(QMainWindow):
 
     def _on_panel_added(self, entry) -> None:
         self._refresh_console_namespace()
+        if entry.kind == "video":
+            entry.panel.dff_extracted.connect(self._on_dff_extracted)
+            # No timeout: keep the message visible for the whole extraction
+            # (a single big block read can exceed any timeout); the next status
+            # message replaces it.
+            entry.panel.roi_status.connect(
+                lambda msg: self.statusBar().showMessage(msg)
+            )
         # A freshly loaded video should be visible: jump to the Video workspace.
         self._set_workspace("Video")
 
     def _on_panel_removed(self, entry) -> None:
         self._refresh_console_namespace()
+        # Forget any ROI ΔF/F panel that was just closed so it gets rebuilt later.
+        for name, e in list(self._roi_trace_panels.items()):
+            if e is entry:
+                del self._roi_trace_panels[name]
+
+    def _on_dff_extracted(self, video_name: str, traces) -> None:
+        """Route extracted ΔF/F traces into a dedicated per-video signal panel,
+        creating it on first use and updating only the extracted ROIs' traces."""
+        entry = self._roi_trace_panels.get(video_name)
+        if entry is None or entry not in self.panel_manager.entries:
+            panel = SignalPanel(name=f"ROI ΔF/F — {video_name}")
+            entry = self.panel_manager.register_signal_panel(panel, panel.name)
+            self._roi_trace_panels[video_name] = entry
+        for tr in traces:
+            entry.panel.remove_trace(tr.name)
+            entry.panel.add_trace(tr)
 
     # ----- Persistence -----
 
@@ -433,6 +466,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_settings()
+        # Cancel any in-flight ROI extraction threads so we don't get
+        # "QThread destroyed while running" and a slow, blocked shutdown.
+        for entry in self.panel_manager.video_entries:
+            try:
+                entry.panel.stop_roi_worker()
+            except Exception:
+                pass
         try:
             self.jupyter_launcher.stop()
         except Exception:

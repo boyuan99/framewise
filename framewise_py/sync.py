@@ -15,12 +15,22 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
+    QColorDialog,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
+    QMenu,
     QPushButton,
+    QSpinBox,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -28,6 +38,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .settings import get_last_dir, set_last_dir_from_path
+from .signal_panel import SignalPanel
 from .video_panel import VideoPanel
 
 if TYPE_CHECKING:
@@ -115,6 +126,68 @@ class SyncController:
             self._dispatching = False
 
 
+class _RoiPropertiesDialog(QDialog):
+    """Edit an ROI's visual properties: color, line width, fill + fill alpha."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        color: tuple,
+        line_width: float,
+        fill: bool,
+        fill_alpha: int,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("ROI properties")
+        self._color = QColor(*color)
+
+        form = QFormLayout(self)
+
+        self._color_btn = QPushButton()
+        self._color_btn.clicked.connect(self._pick_color)
+        self._refresh_color_btn()
+        form.addRow("Color", self._color_btn)
+
+        self._width = QDoubleSpinBox()
+        self._width.setRange(0.5, 10.0)
+        self._width.setSingleStep(0.5)
+        self._width.setValue(float(line_width))
+        form.addRow("Line width", self._width)
+
+        self._fill = QCheckBox()
+        self._fill.setChecked(bool(fill))
+        form.addRow("Fill", self._fill)
+
+        self._alpha = QSpinBox()
+        self._alpha.setRange(0, 255)
+        self._alpha.setValue(int(fill_alpha))
+        self._alpha.setEnabled(bool(fill))
+        self._fill.toggled.connect(self._alpha.setEnabled)
+        form.addRow("Fill alpha", self._alpha)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def _pick_color(self) -> None:
+        c = QColorDialog.getColor(self._color, self, "ROI color")
+        if c.isValid():
+            self._color = c
+            self._refresh_color_btn()
+
+    def _refresh_color_btn(self) -> None:
+        self._color_btn.setText(self._color.name())
+        self._color_btn.setStyleSheet(f"background:{self._color.name()};")
+
+    def values(self) -> tuple:
+        """Return (color_rgb, line_width, fill, fill_alpha)."""
+        rgb = (self._color.red(), self._color.green(), self._color.blue())
+        return rgb, self._width.value(), self._fill.isChecked(), self._alpha.value()
+
+
 class ResourceManagerPanel(QWidget):
     """Hierarchical resource tree: panels at the top level with overlays as
     children. Sync-group membership checkboxes live on the top-level video
@@ -149,6 +222,13 @@ class ResourceManagerPanel(QWidget):
         for i in range(1, self.tree.columnCount()):
             header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.setRootIsDecorated(True)
+        # ROI management lives here: multi-select nodes + right-click actions.
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_context_menu)
+        self.tree.itemSelectionChanged.connect(self._on_selection_changed)
+        # Trace-visibility checkboxes on signal-panel children flow through here.
+        self.tree.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.tree, stretch=1)
 
         btn_row = QHBoxLayout()
@@ -183,12 +263,16 @@ class ResourceManagerPanel(QWidget):
             self.tree.setColumnCount(1 + n_groups)
             self.tree.setHeaderLabels(self._header_labels())
 
+            # Block itemChanged: setCheckState below would otherwise fire the
+            # trace-visibility handler during the rebuild.
+            self.tree.blockSignals(True)
             self.tree.clear()
             for entry in self._panel_manager.entries:
                 top = QTreeWidgetItem([f"[{entry.kind}] {entry.panel.name}"])
                 self.tree.addTopLevelItem(top)
 
                 if isinstance(entry.panel, VideoPanel):
+                    top.setData(0, Qt.ItemDataRole.UserRole, ("video", entry.panel))
                     for col in range(n_groups):
                         self.tree.setItemWidget(
                             top, col + 1, self._make_group_checkbox(entry.panel, col)
@@ -196,9 +280,51 @@ class ResourceManagerPanel(QWidget):
                     for ov in entry.panel._overlays:  # noqa: SLF001
                         child = QTreeWidgetItem([f"[overlay {ov.kind}] {ov.name}"])
                         top.addChild(child)
+
+                    # ROIs grouped under a folder node; each ROI is its own child.
+                    folder = QTreeWidgetItem(["ROIs"])
+                    folder.setData(
+                        0, Qt.ItemDataRole.UserRole, ("roi_folder", entry.panel)
+                    )
+                    top.addChild(folder)
+                    for r in entry.panel.rois:
+                        node = QTreeWidgetItem([f"[ellipse] {r.name}"])
+                        node.setData(
+                            0, Qt.ItemDataRole.UserRole, ("roi", entry.panel, r.id)
+                        )
+                        folder.addChild(node)
+                    folder.setExpanded(True)
+                    top.setExpanded(True)
+
+                elif isinstance(entry.panel, SignalPanel):
+                    # Each trace is a checkable child: checkbox = visibility,
+                    # text colored like the plotted line (tree doubles as legend).
+                    for name in entry.panel.trace_names():
+                        node = QTreeWidgetItem([name])
+                        node.setData(
+                            0, Qt.ItemDataRole.UserRole, ("trace", entry.panel, name)
+                        )
+                        node.setFlags(
+                            node.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                        )
+                        node.setCheckState(
+                            0,
+                            Qt.CheckState.Checked
+                            if entry.panel.is_trace_visible(name)
+                            else Qt.CheckState.Unchecked,
+                        )
+                        color = entry.panel.trace_color(name)
+                        if color:
+                            node.setForeground(0, QColor(color))
+                        top.addChild(node)
                     top.setExpanded(True)
         except RuntimeError:
             return
+        finally:
+            try:
+                self.tree.blockSignals(False)
+            except RuntimeError:
+                pass
 
     def _make_group_checkbox(self, panel: VideoPanel, group_id: int) -> QWidget:
         cb = QCheckBox()
@@ -221,12 +347,121 @@ class ResourceManagerPanel(QWidget):
             self._controller.add_panel(entry.panel)
             entry.panel.overlay_added.connect(lambda *_: self._refresh_tree())
             entry.panel.overlay_removed.connect(lambda *_: self._refresh_tree())
+            entry.panel.roi_added.connect(lambda *_: self._refresh_tree())
+            entry.panel.roi_removed.connect(lambda *_: self._refresh_tree())
+        elif isinstance(entry.panel, SignalPanel):
+            entry.panel.traces_changed.connect(lambda *_: self._refresh_tree())
         self._refresh_tree()
+
+    def _on_item_changed(self, item, column) -> None:
+        """A trace node's checkbox toggled → show/hide that trace."""
+        tag = item.data(0, Qt.ItemDataRole.UserRole)
+        if tag and tag[0] == "trace":
+            _, panel, name = tag
+            panel.set_trace_visible(
+                name, item.checkState(0) == Qt.CheckState.Checked
+            )
 
     def _on_panel_removed(self, entry: "PanelEntry") -> None:
         if isinstance(entry.panel, VideoPanel):
             self._controller.remove_panel(entry.panel)
         self._refresh_tree()
+
+    # ----- ROI actions (this tree is the ROI management surface) -----
+
+    def _selected_roi_pairs(self) -> list[tuple]:
+        """(panel, roi_id) for every selected ROI node."""
+        pairs = []
+        for item in self.tree.selectedItems():
+            tag = item.data(0, Qt.ItemDataRole.UserRole)
+            if tag and tag[0] == "roi":
+                pairs.append((tag[1], tag[2]))
+        return pairs
+
+    def _on_selection_changed(self) -> None:
+        # Highlight selected ROIs on each video's canvas; clear the rest.
+        by_panel: dict = {}
+        for panel, rid in self._selected_roi_pairs():
+            by_panel.setdefault(panel, set()).add(rid)
+        for entry in self._panel_manager.entries:
+            if isinstance(entry.panel, VideoPanel):
+                entry.panel.set_roi_highlight(by_panel.get(entry.panel, set()))
+
+    def _on_context_menu(self, pos) -> None:
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        tag = item.data(0, Qt.ItemDataRole.UserRole)
+        if not tag:
+            return
+
+        menu = QMenu(self)
+        if tag[0] in ("video", "roi_folder"):
+            panel = tag[1]
+            menu.addAction("Add Ellipse ROI", lambda: panel.add_ellipse_roi())
+            all_ids = [r.id for r in panel.rois]
+            if all_ids:
+                # Extract every ROI on this video in one pass into its ΔF/F panel.
+                menu.addAction(
+                    f"Extract ΔF/F (all {len(all_ids)})",
+                    lambda ids=all_ids, p=panel: p.extract_dff(ids),
+                )
+        elif tag[0] == "roi":
+            # Right-clicking one node of a multi-selection acts on the whole
+            # selection; right-clicking an unselected node acts on just it.
+            pairs = self._selected_roi_pairs()
+            if (tag[1], tag[2]) not in pairs:
+                pairs = [(tag[1], tag[2])]
+            menu.addAction(
+                f"Extract ΔF/F ({len(pairs)})", lambda: self._extract_selected(pairs)
+            )
+            menu.addAction("Delete", lambda: self._delete_selected(pairs))
+            menu.addAction("Properties…", lambda: self._edit_roi_properties(pairs))
+            if len(pairs) == 1:
+                menu.addAction("Rename…", lambda: self._rename_roi(pairs[0]))
+
+        if menu.actions():
+            menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _extract_selected(self, pairs: list[tuple]) -> None:
+        by_panel: dict = {}
+        for panel, rid in pairs:
+            by_panel.setdefault(panel, []).append(rid)
+        for panel, ids in by_panel.items():
+            panel.extract_dff(ids)
+
+    def _delete_selected(self, pairs: list[tuple]) -> None:
+        for panel, rid in pairs:
+            panel.remove_roi(rid)
+
+    def _rename_roi(self, pair: tuple) -> None:
+        panel, rid = pair
+        item = next((r for r in panel.rois if r.id == rid), None)
+        current = item.name if item else rid
+        text, ok = QInputDialog.getText(self, "Rename ROI", "Name:", text=current)
+        if ok and text.strip():
+            panel.rename_roi(rid, text.strip())
+            self._refresh_tree()
+
+    def _edit_roi_properties(self, pairs: list[tuple]) -> None:
+        """Open the properties dialog seeded from the first selected ROI; apply
+        the chosen color / width / fill to every selected ROI."""
+        panel0, rid0 = pairs[0]
+        item0 = next((r for r in panel0.rois if r.id == rid0), None)
+        if item0 is None:
+            return
+        dlg = _RoiPropertiesDialog(
+            self, item0.color, item0.line_width, item0.fill, item0.fill_alpha
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        color, width, fill, alpha = dlg.values()
+        for panel, rid in pairs:
+            panel.set_roi_properties(
+                rid, color=color, line_width=width, fill=fill, fill_alpha=alpha
+            )
+        # Re-apply the selection highlight (set_roi_properties resets pen width).
+        self._on_selection_changed()
 
     def _add_group(self) -> None:
         self._controller.add_group()

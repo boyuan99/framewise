@@ -99,7 +99,13 @@ class VideoGrid(QWidget):
         self._mdi.cascadeSubWindows()
 
     def _update_view(self) -> None:
-        self._stack.setCurrentIndex(1 if self._subs else 0)
+        # On app shutdown a sub-window's destroyed signal can fire after the
+        # central QStackedLayout's C++ object is already gone; ignore that race
+        # (mirrors ResourceManagerPanel._refresh_tree's RuntimeError guard).
+        try:
+            self._stack.setCurrentIndex(1 if self._subs else 0)
+        except RuntimeError:
+            return
 
 
 class PanelManager:
@@ -152,6 +158,13 @@ class PanelManager:
         traces, name = load_tdt(path)
         panel = SignalPanel(name=name, traces=traces)
         return self._register(panel, name, path, "signal")
+
+    def register_signal_panel(self, panel: SignalPanel, name: str) -> PanelEntry:
+        """Register a pre-built SignalPanel (e.g. ROI ΔF/F) with no source file.
+
+        Routes it into the grid and binds the master clock like any other panel.
+        """
+        return self._register(panel, name, Path(""), "signal")
 
     def _register(
         self,

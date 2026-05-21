@@ -106,7 +106,16 @@ def _load_hdf5(path: Path) -> da.Array:
         raise LoadError(f"No 3D/4D dataset found in {path}")
 
     chunks = (1,) + dataset.shape[1:]
-    return da.from_array(dataset, chunks=chunks)
+    arr = da.from_array(dataset, chunks=chunks)
+    # Record the source so heavy readers (ROI extraction) can open their own
+    # read-only handle and pull big contiguous/bbox hyperslabs in one call,
+    # instead of dask's per-frame (1,H,W) chunk reads. Guarded: if the dask
+    # Array forbids attribute assignment, callers just fall back to dask.
+    try:
+        arr.framewise_h5 = (str(path), dataset.name)
+    except Exception:
+        pass
+    return arr
 
 
 def _find_video_dataset(group: h5py.Group, path: str = "/") -> h5py.Dataset | None:

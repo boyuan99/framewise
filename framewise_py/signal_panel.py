@@ -15,8 +15,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
@@ -57,6 +58,10 @@ class Trace:
 class SignalPanel(QWidget):
     """One signal panel with N traces sharing the master clock."""
 
+    # Emitted whenever the trace set changes (add/remove) so the Resource
+    # Manager can refresh this panel's per-trace visibility children.
+    traces_changed = pyqtSignal()
+
     def __init__(
         self,
         name: str,
@@ -69,6 +74,7 @@ class SignalPanel(QWidget):
         self._window = float(window_seconds)
         self._master_clock: MasterClock | None = None
         self._trace_items: dict[str, pg.PlotDataItem] = {}
+        self._trace_colors: dict[str, str] = {}  # name -> color, stable across re-adds
 
         self._build_ui()
         for t in traces or []:
@@ -85,7 +91,11 @@ class SignalPanel(QWidget):
         self._on_master_time_changed(clock.time)
 
     def add_trace(self, trace: Trace) -> None:
-        color = _TRACE_COLORS[len(self._trace_items) % len(_TRACE_COLORS)]
+        # Stable color per name so re-extracting a trace keeps its color.
+        color = self._trace_colors.get(trace.name)
+        if color is None:
+            color = _TRACE_COLORS[len(self._trace_colors) % len(_TRACE_COLORS)]
+            self._trace_colors[trace.name] = color
         pen = pg.mkPen(color=color, width=1.5)
         item = self.plot.plot(
             trace.time_axis(),
@@ -94,11 +104,43 @@ class SignalPanel(QWidget):
             name=trace.name,
         )
         self._trace_items[trace.name] = item
+        self.traces_changed.emit()
 
     def remove_trace(self, name: str) -> None:
         item = self._trace_items.pop(name, None)
         if item is not None:
             self.plot.removeItem(item)
+        self.traces_changed.emit()
+
+    # ----- per-trace visibility (managed from the Resource Manager) -----
+
+    def trace_names(self) -> list[str]:
+        return list(self._trace_items.keys())
+
+    def trace_color(self, name: str) -> str | None:
+        return self._trace_colors.get(name)
+
+    def is_trace_visible(self, name: str) -> bool:
+        item = self._trace_items.get(name)
+        return bool(item.isVisible()) if item is not None else False
+
+    def set_trace_visible(self, name: str, visible: bool) -> None:
+        item = self._trace_items.get(name)
+        if item is not None:
+            item.setVisible(bool(visible))
+
+    def set_legend_visible(self, on: bool) -> None:
+        if self.legend is not None:
+            self.legend.setVisible(bool(on))
+
+    def trace_arrays(self) -> dict[str, np.ndarray]:
+        """{trace name: plotted y-data} — lets the console read ΔF/F values."""
+        out: dict[str, np.ndarray] = {}
+        for name, item in self._trace_items.items():
+            data = item.getData()
+            if data is not None and data[1] is not None:
+                out[name] = np.asarray(data[1])
+        return out
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -108,8 +150,11 @@ class SignalPanel(QWidget):
         self.plot = pg.PlotWidget()
         self.plot.setBackground("w")
         self.plot.showGrid(x=True, y=True, alpha=0.2)
-        self.plot.addLegend(offset=(10, 10))
+        self.legend = self.plot.addLegend(offset=(10, 10))
         self.plot.setMouseEnabled(x=False, y=True)  # x is master-clock controlled
+        # x can't be free-zoomed (it re-centers on the clock each tick), so make
+        # the mouse wheel resize the time window instead — centered on the cursor.
+        self.plot.getViewBox().wheelEvent = self._on_wheel_zoom
         layout.addWidget(self.plot, stretch=1)
 
         # Vertical cursor at master clock time
@@ -121,6 +166,16 @@ class SignalPanel(QWidget):
         self.plot.addItem(self.cursor, ignoreBounds=True)
 
         controls = QHBoxLayout()
+
+        self.cb_legend = QCheckBox("Legend")
+        self.cb_legend.setChecked(True)
+        self.cb_legend.setToolTip(
+            "Show/hide the plot legend. With many traces, hide it and manage "
+            "trace visibility in the Resource Manager instead."
+        )
+        self.cb_legend.toggled.connect(self.set_legend_visible)
+        controls.addWidget(self.cb_legend)
+
         controls.addStretch()
 
         self.time_label = QLabel("t = 0.000 s")
@@ -133,11 +188,27 @@ class SignalPanel(QWidget):
         self.window_spin.setDecimals(1)
         self.window_spin.setSingleStep(1.0)
         self.window_spin.setValue(self._window)
-        self.window_spin.setFixedWidth(70)
+        # Wide enough for "600.0" plus the up/down arrows (was 70 → arrows
+        # overlapped the text).
+        self.window_spin.setMinimumWidth(96)
+        self.window_spin.setToolTip("Time window (s). Scroll over the plot to zoom.")
         self.window_spin.valueChanged.connect(self._on_window_changed)
         controls.addWidget(self.window_spin)
 
         layout.addLayout(controls)
+
+    def _on_wheel_zoom(self, ev, axis=None) -> None:
+        """Scroll up = zoom in (smaller window), down = zoom out. Drives the
+        spinbox, which re-ranges the x axis around the clock cursor."""
+        try:
+            delta = ev.delta()
+        except AttributeError:  # newer Qt wheel event
+            delta = ev.angleDelta().y()
+        if delta:
+            factor = 0.8 if delta > 0 else 1.25
+            new = min(600.0, max(0.1, self._window * factor))
+            self.window_spin.setValue(round(new, 1))
+        ev.accept()
 
     def _on_master_time_changed(self, t: float) -> None:
         self.cursor.setPos(t)

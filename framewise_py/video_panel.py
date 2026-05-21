@@ -13,8 +13,15 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QContextMenuEvent, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import QEvent, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QAction,
+    QBrush,
+    QContextMenuEvent,
+    QDragEnterEvent,
+    QDropEvent,
+    QPainter,
+)
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -35,9 +42,21 @@ from PyQt6.QtWidgets import (
 
 from .loaders import LoadError, load_overlay
 from .master_clock import MasterClock
+from .roi import RoiItem, TraceExtractWorker, ellipse_mask
 from .settings import get_last_dir, set_last_dir_from_path
 
 DEFAULT_FPS = 20.0
+
+# Cycling pen colors for ROI outlines (distinct, bright). Reused as trace colors.
+_ROI_COLORS = [
+    (255, 215, 0),
+    (238, 102, 119),
+    (34, 136, 51),
+    (102, 204, 238),
+    (170, 51, 119),
+    (204, 187, 68),
+    (68, 119, 170),
+]
 
 # Two-stop colormaps: black → tint color. Names are user-facing.
 # RGB(A) images ignore these (pyqtgraph skips LUT for multi-channel data).
@@ -101,6 +120,30 @@ class _Overlay:
     visible_cb: QCheckBox | None = None  # so Flip can drive the UI in sync
 
 
+class _FillableEllipseROI(pg.EllipseROI):
+    """An EllipseROI that can optionally fill its interior.
+
+    pyqtgraph ROIs draw only an outline; we override paint() to add a brush so
+    ROIs can be shown filled with an adjustable alpha.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._fill_brush: QBrush | None = None
+
+    def set_fill_brush(self, brush: QBrush | None) -> None:
+        self._fill_brush = brush
+        self.update()
+
+    def paint(self, p, opt, widget) -> None:  # noqa: D401 - mirrors EllipseROI.paint
+        r = self.boundingRect()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(self.currentPen)
+        p.setBrush(self._fill_brush if self._fill_brush is not None else QBrush())
+        p.scale(r.width(), r.height())
+        p.drawEllipse(QRectF(0.0, 0.0, 1.0, 1.0))
+
+
 class VideoPanel(QWidget):
     """One video's display + scrubbing controls.
 
@@ -116,6 +159,19 @@ class VideoPanel(QWidget):
     # remove). Lets the Resource Manager refresh the tree without polling.
     overlay_added = pyqtSignal(object)
     overlay_removed = pyqtSignal(object)
+
+    # Emitted with `self` whenever this panel's ROI list changes (add / remove),
+    # so the Resource Manager can refresh its ROI nodes without polling.
+    roi_added = pyqtSignal(object)
+    roi_removed = pyqtSignal(object)
+
+    # Emitted (panel_name, list[Trace]) when a ΔF/F extraction finishes; the
+    # main window routes the traces into a dedicated ROI signal panel.
+    dff_extracted = pyqtSignal(str, object)
+
+    # Human-readable extraction status (start / progress / done), shown in the
+    # main window status bar so long extractions give feedback.
+    roi_status = pyqtSignal(str)
 
     def __init__(
         self,
@@ -133,6 +189,13 @@ class VideoPanel(QWidget):
         self._syncing = False
         self._master_clock: MasterClock | None = None
         self._overlays: list[_Overlay] = []
+        self._rois: list[RoiItem] = []
+        self._roi_counter = 0
+        self._roi_worker: TraceExtractWorker | None = None
+        # Drag-to-draw state (active while the "✏ ROI" button is toggled on).
+        self._draw_mode = False
+        self._draw_start: tuple[float, float] | None = None
+        self._draw_item: RoiItem | None = None
 
         self.setAcceptDrops(True)
         self._build_ui()
@@ -192,6 +255,8 @@ class VideoPanel(QWidget):
         self.image_view.ui.menuBtn.hide()
         self.image_view.ui.roiBtn.hide()
         layout.addWidget(self.image_view, stretch=1)
+        # Intercept scene mouse events so "✏ ROI" mode can drag out new ellipses.
+        self.image_view.getView().scene().installEventFilter(self)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, self._n_frames - 1)
@@ -259,6 +324,16 @@ class VideoPanel(QWidget):
         self.btn_add_overlay.setToolTip("Add an image or video as an overlay layer")
         self.btn_add_overlay.clicked.connect(self._on_add_overlay_clicked)
         controls.addWidget(self.btn_add_overlay)
+
+        self.btn_draw_roi = QPushButton("✏ ROI")
+        self.btn_draw_roi.setCheckable(True)
+        self.btn_draw_roi.setFixedWidth(64)
+        self.btn_draw_roi.setToolTip(
+            "Draw ellipse ROIs by dragging on the video. Stays on so you can draw "
+            "several; toggle off to pan/zoom again."
+        )
+        self.btn_draw_roi.toggled.connect(self._on_draw_toggled)
+        controls.addWidget(self.btn_draw_roi)
 
         # The control row's combined minimum width (~600px) would otherwise pin
         # the panel's — and therefore the MDI sub-window's — minimum width,
@@ -438,6 +513,182 @@ class VideoPanel(QWidget):
     def _frame_text(self, frame: int) -> str:
         t = frame / self._fps
         return f"Frame {frame} / {self._n_frames - 1}  |  t = {t:.3f} s"
+
+    # ----- ROI management -----
+    #
+    # The panel OWNS the ROI items (they live on its ViewBox) but has no ROI UI;
+    # the Resource Manager tree drives these methods and listens to the signals.
+
+    @property
+    def rois(self) -> list[RoiItem]:
+        return list(self._rois)
+
+    @property
+    def frame_hw(self) -> tuple[int, int]:
+        """Raw frame (H, W) — the shape masks index into."""
+        return int(self._array.shape[1]), int(self._array.shape[2])
+
+    def _apply_roi_style(self, item: RoiItem, selected: bool) -> None:
+        """Push an ROI item's color / width / fill onto its canvas item. Selected
+        ROIs get a thicker pen so tree selection is visible."""
+        width = item.line_width + (2.0 if selected else 0.0)
+        item.roi.setPen(pg.mkPen(color=item.color, width=width))
+        if item.fill:
+            r, g, b = item.color
+            item.roi.set_fill_brush(pg.mkBrush(r, g, b, item.fill_alpha))
+        else:
+            item.roi.set_fill_brush(None)
+
+    def add_ellipse_roi(self, pos=None, size=None) -> RoiItem:
+        """Add an ellipse ROI and return its item. With no args it is centered at
+        ~1/4 frame size; `pos`/`size` (displayed (W,H) coords) come from drag-draw."""
+        self._roi_counter += 1
+        color = _ROI_COLORS[(self._roi_counter - 1) % len(_ROI_COLORS)]
+        roi_id = f"ROI_{self._roi_counter:03d}"
+
+        # ViewBox coords are displayed (W, H): x spans the frame width, y height.
+        H, W = self.frame_hw
+        if size is None:
+            size = (W / 4.0, H / 4.0)
+        sw, sh = float(size[0]), float(size[1])
+        if pos is None:
+            pos = (W / 2.0 - sw / 2.0, H / 2.0 - sh / 2.0)
+
+        roi = _FillableEllipseROI(
+            (float(pos[0]), float(pos[1])), (sw, sh), removable=False
+        )
+        roi.setZValue(1000)  # above base + overlays
+        self.image_view.getView().addItem(roi)
+
+        item = RoiItem(id=roi_id, name=roi_id, roi=roi, color=color)
+        self._rois.append(item)
+        self._apply_roi_style(item, selected=False)
+        self.roi_added.emit(self)
+        return item
+
+    def remove_roi(self, roi_id: str) -> None:
+        item = next((r for r in self._rois if r.id == roi_id), None)
+        if item is None:
+            return
+        self.image_view.getView().removeItem(item.roi)
+        self._rois.remove(item)
+        self.roi_removed.emit(self)
+
+    def rename_roi(self, roi_id: str, name: str) -> None:
+        item = next((r for r in self._rois if r.id == roi_id), None)
+        if item is not None and name:
+            item.name = name
+
+    def set_roi_properties(
+        self,
+        roi_id: str,
+        *,
+        color: tuple | None = None,
+        line_width: float | None = None,
+        fill: bool | None = None,
+        fill_alpha: int | None = None,
+    ) -> None:
+        """Update an ROI's visual properties (color / line width / fill / alpha)."""
+        item = next((r for r in self._rois if r.id == roi_id), None)
+        if item is None:
+            return
+        if color is not None:
+            item.color = tuple(color)
+        if line_width is not None:
+            item.line_width = float(line_width)
+        if fill is not None:
+            item.fill = bool(fill)
+        if fill_alpha is not None:
+            item.fill_alpha = int(fill_alpha)
+        self._apply_roi_style(item, selected=False)
+
+    def set_roi_highlight(self, selected_ids: set[str]) -> None:
+        """Re-style ROIs so the tree selection shows on canvas (thicker pen)."""
+        for item in self._rois:
+            self._apply_roi_style(item, item.id in selected_ids)
+
+    # ----- Drag-to-draw -----
+
+    def _on_draw_toggled(self, on: bool) -> None:
+        self._draw_mode = bool(on)
+        view = self.image_view.getView()
+        view.setCursor(
+            Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor
+        )
+
+    def eventFilter(self, obj, event) -> bool:
+        """In draw mode, turn a left-drag on the image into a new ellipse ROI."""
+        if not self._draw_mode:
+            return super().eventFilter(obj, event)
+
+        et = event.type()
+        view = self.image_view.getView()
+        if (
+            et == QEvent.Type.GraphicsSceneMousePress
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            p = view.mapSceneToView(event.scenePos())
+            self._draw_start = (p.x(), p.y())
+            self._draw_item = self.add_ellipse_roi(pos=self._draw_start, size=(1.0, 1.0))
+            return True
+        if et == QEvent.Type.GraphicsSceneMouseMove and self._draw_start is not None:
+            p = view.mapSceneToView(event.scenePos())
+            x0, y0 = self._draw_start
+            x1, y1 = p.x(), p.y()
+            self._draw_item.roi.setPos((min(x0, x1), min(y0, y1)))
+            self._draw_item.roi.setSize((abs(x1 - x0), abs(y1 - y0)))
+            return True
+        if et == QEvent.Type.GraphicsSceneMouseRelease and self._draw_start is not None:
+            item = self._draw_item
+            self._draw_start = None
+            self._draw_item = None
+            # Discard accidental clicks that produced a degenerate ellipse.
+            if item is not None and (item.roi.size()[0] < 3 or item.roi.size()[1] < 3):
+                self.remove_roi(item.id)
+            return True
+        return super().eventFilter(obj, event)
+
+    def extract_dff(self, roi_ids: list[str]) -> None:
+        """Extract ΔF/F for the given ROIs off-thread; emit `dff_extracted` when done."""
+        if self._roi_worker is not None and self._roi_worker.isRunning():
+            self._emit_status("ΔF/F extraction already running for this video")
+            return  # one extraction per panel at a time
+        items = [r for r in self._rois if r.id in set(roi_ids)]
+        if not items:
+            return
+
+        hw = self.frame_hw
+        masks_with_labels = [
+            (it.name, ellipse_mask(it.roi.pos(), it.roi.size(), it.roi.angle(), hw))
+            for it in items
+        ]
+        worker = TraceExtractWorker(
+            self._array, masks_with_labels, self._n_frames, self._fps, parent=self
+        )
+        worker.progress.connect(self._emit_status)
+        worker.traces_ready.connect(self._on_traces_ready)
+        self._roi_worker = worker
+        self._emit_status(
+            f"Extracting ΔF/F for {len(items)} ROI(s) over {self._n_frames} frames…"
+        )
+        worker.start()
+
+    def _emit_status(self, msg: str) -> None:
+        print(f"[{self._name}] {msg}")
+        self.roi_status.emit(msg)
+
+    def _on_traces_ready(self, traces) -> None:
+        self._roi_worker = None
+        self._emit_status(f"ΔF/F extraction done: {len(traces)} trace(s)")
+        self.dff_extracted.emit(self._name, traces)
+
+    def stop_roi_worker(self) -> None:
+        """Cancel and join any running extraction so the app can exit cleanly."""
+        worker = self._roi_worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            worker.wait(3000)
+        self._roi_worker = None
 
     # ----- Overlay management -----
 
