@@ -213,3 +213,49 @@ class RoiNamespaceProvider:
             return arrays(entry) if entry is not None else {}
 
         return {"rois": rois, "roi_masks": roi_masks, "roi_dff": roi_dff}
+
+
+class SegmentationNamespaceProvider:
+    """Exposes loaded segmentation results (footprints A, activity C, selection)
+    to the console / embedded Jupyter Lab.
+
+    Like the ROI provider, these are live objects (the sparse `A`, the in-RAM
+    `C`, the live panel selection), so they are injected only for the in-process
+    kernel. Out-of-process mode injects nothing — switch View → Console kernel →
+    Same-process.
+    """
+
+    def __init__(self, window: "MainWindow") -> None:
+        self._window = window
+
+    def collect(self, host: "KernelHost") -> dict[str, Any]:
+        if not host.is_same_process:
+            return {}
+
+        w = self._window
+
+        def _panels() -> dict:
+            return {
+                e.panel.name: e.panel
+                for e in w.panel_manager.entries
+                if e.kind == "segmentation"
+            }
+
+        def _require(name: str):
+            ps = _panels()
+            if name not in ps:
+                raise KeyError(f"No segmentation named {name!r}. Available: {list(ps)}")
+            return ps[name]
+
+        def seg(name: str | None = None):
+            """SegmentationResult(s). With no arg: {name: SegmentationResult};
+            with a name: that one (has .A .C .footprint(n) .trace(n) .neuron_at …)."""
+            if name is None:
+                return {n: p.seg for n, p in _panels().items()}
+            return _require(name).seg
+
+        def selected_neurons(name: str) -> list[int]:
+            """0-based indices of neurons currently selected on that panel."""
+            return _require(name).selected_neurons
+
+        return {"seg": seg, "selected_neurons": selected_neurons}

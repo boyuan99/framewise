@@ -27,7 +27,11 @@ from PyQt6.QtWidgets import (
 
 from .console_panel import ConsolePanel, JupyterLabLauncher
 from .master_clock import MasterClock
-from .namespace import CoreNamespaceProvider, RoiNamespaceProvider
+from .namespace import (
+    CoreNamespaceProvider,
+    RoiNamespaceProvider,
+    SegmentationNamespaceProvider,
+)
 from .notebook_panel import WEBENGINE_AVAILABLE, NotebookPanel
 from .panels import PanelManager, VideoGrid
 from .settings import get_last_dir, set_last_dir_from_path, settings
@@ -80,6 +84,7 @@ class MainWindow(QMainWindow):
         self._namespace_providers = [
             CoreNamespaceProvider(self),
             RoiNamespaceProvider(self),
+            SegmentationNamespaceProvider(self),
         ]
         self.console_panel = ConsolePanel(self._collect_namespace, parent=self)
         self.console_dock = QDockWidget("Console", self)
@@ -117,6 +122,8 @@ class MainWindow(QMainWindow):
 
         # One dedicated ΔF/F signal panel per source video, keyed by video name.
         self._roi_trace_panels: dict = {}
+        # One dedicated activity-trace panel per segmentation, keyed by name.
+        self._neuron_trace_panels: dict = {}
 
         # Workspace = which central page is shown (Video grid vs Notebook).
         self._ws_tabbar: QTabBar | None = None
@@ -144,6 +151,14 @@ class MainWindow(QMainWindow):
         act_open.setShortcut("Ctrl+O")
         act_open.triggered.connect(self._open_dialog)
         file_menu.addAction(act_open)
+
+        act_open_folder = QAction("Open &Folder…", self)
+        act_open_folder.setShortcut("Ctrl+Shift+O")
+        act_open_folder.setToolTip(
+            "Open a folder: a segmentation result (SEG/ + rmbg/) or a TDT block"
+        )
+        act_open_folder.triggered.connect(self._open_folder_dialog)
+        file_menu.addAction(act_open_folder)
 
         file_menu.addSeparator()
 
@@ -266,6 +281,16 @@ class MainWindow(QMainWindow):
             set_last_dir_from_path(paths[0])
         for p in paths:
             self.add_video(p)
+
+    def _open_folder_dialog(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Open folder (segmentation result or TDT block)",
+            get_last_dir(),
+        )
+        if path:
+            set_last_dir_from_path(path)
+            self.add_video(path)
 
     # ----- Playback -----
 
@@ -428,6 +453,16 @@ class MainWindow(QMainWindow):
             entry.panel.roi_status.connect(
                 lambda msg: self.statusBar().showMessage(msg)
             )
+        elif entry.kind == "segmentation":
+            entry.panel.neuron_toggled.connect(
+                lambda n, sel, e=entry: self._on_neuron_toggled(e, n, sel)
+            )
+            entry.panel.fps_changed.connect(
+                lambda _fps, e=entry: self._on_seg_fps_changed(e)
+            )
+            entry.panel.roi_status.connect(
+                lambda msg: self.statusBar().showMessage(msg, 6000)
+            )
         # A freshly loaded video should be visible: jump to the Video workspace.
         self._set_workspace("Video")
 
@@ -437,6 +472,9 @@ class MainWindow(QMainWindow):
         for name, e in list(self._roi_trace_panels.items()):
             if e is entry:
                 del self._roi_trace_panels[name]
+        for name, panels in list(self._neuron_trace_panels.items()):
+            if entry in (panels.get("raw"), panels.get("demix")):
+                del self._neuron_trace_panels[name]
 
     def _on_dff_extracted(self, video_name: str, traces) -> None:
         """Route extracted ΔF/F traces into a dedicated per-video signal panel,
@@ -449,6 +487,84 @@ class MainWindow(QMainWindow):
         for tr in traces:
             entry.panel.remove_trace(tr.name)
             entry.panel.add_trace(tr)
+
+    def _on_neuron_toggled(self, seg_entry, n: int, selected: bool) -> None:
+        """Add/remove a clicked neuron's trace in the segmentation's companion
+        panel(s): raw C in one, demixed C in a second when demix data is loaded.
+        Both are colored to match the footprint and share the master clock, so
+        raw vs demix line up in time for side-by-side comparison."""
+        panels = self._neuron_companions(seg_entry, create=selected)
+        if panels is None:
+            return
+        seg = seg_entry.panel.seg
+        color = "#{:02x}{:02x}{:02x}".format(*seg.neuron_color(n))
+        for kind, entry in panels.items():
+            if entry is None:
+                continue
+            trace = seg.trace(n) if kind == "raw" else seg.trace_demix(n)
+            entry.panel.remove_trace(trace.name)  # idempotent: avoid duplicates
+            if selected:
+                entry.panel.add_trace(trace, color=color)
+                entry.panel.neuron_of_trace[trace.name] = int(n)
+            else:
+                entry.panel.neuron_of_trace.pop(trace.name, None)
+
+    def _on_seg_fps_changed(self, seg_entry) -> None:
+        """The segmentation panel's fps changed → re-derive its companion neuron
+        traces at the new sampling rate so their time axis stays frame-locked."""
+        panels = self._neuron_trace_panels.get(seg_entry.panel.seg.name)
+        if not panels:
+            return
+        seg = seg_entry.panel.seg
+        for n in seg_entry.panel.selected_neurons:
+            color = "#{:02x}{:02x}{:02x}".format(*seg.neuron_color(n))
+            for kind, entry in panels.items():
+                if entry is None or entry not in self.panel_manager.entries:
+                    continue
+                trace = seg.trace(n) if kind == "raw" else seg.trace_demix(n)
+                entry.panel.remove_trace(trace.name)
+                entry.panel.add_trace(trace, color=color)
+
+    def _neuron_companions(self, seg_entry, create: bool):
+        """Return {"raw": entry, "demix": entry|None} for this segmentation's
+        companion trace panels, (re)creating them on first use. None if they
+        don't exist and `create` is False."""
+        seg = seg_entry.panel.seg
+        name = seg.name
+        panels = self._neuron_trace_panels.get(name)
+        alive = panels is not None and all(
+            e in self.panel_manager.entries
+            for e in panels.values()
+            if e is not None
+        )
+        if not alive:
+            if not create:
+                return None
+            has_dm = seg.has_demix
+            panels = {
+                "raw": self._make_companion(
+                    seg_entry, "Neurons raw" if has_dm else "Neurons"
+                ),
+                "demix": self._make_companion(seg_entry, "Neurons demix")
+                if has_dm
+                else None,
+            }
+            self._neuron_trace_panels[name] = panels
+            # Keep raw + demix time windows in sync (the cursor already shares the
+            # master clock; this links the zoom/window so they stay aligned).
+            if panels["demix"] is not None:
+                raw_p, dmx_p = panels["raw"].panel, panels["demix"].panel
+                raw_p.window_changed.connect(dmx_p.set_window)
+                dmx_p.window_changed.connect(raw_p.set_window)
+        return panels
+
+    def _make_companion(self, seg_entry, label: str):
+        """Build + register a companion SignalPanel linked back to the seg panel
+        (so the Resource Manager can map its trace rows to neurons)."""
+        panel = SignalPanel(name=f"{label} — {seg_entry.panel.seg.name}")
+        panel.segmentation_panel = seg_entry.panel
+        panel.neuron_of_trace = {}
+        return self.panel_manager.register_signal_panel(panel, panel.name)
 
     # ----- Persistence -----
 

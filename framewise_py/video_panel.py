@@ -155,6 +155,11 @@ class VideoPanel(QWidget):
     # clicking step buttons. Other listeners (sync controllers) may also use it.
     frame_changed = pyqtSignal(int)
 
+    # Emitted with the new fps whenever this panel's playback rate changes, so
+    # listeners (e.g. a segmentation panel's companion trace plot) can re-derive
+    # any time axis that depends on this panel's frame↔time mapping.
+    fps_changed = pyqtSignal(float)
+
     # Emitted with `self` whenever this panel's overlay list changes (add /
     # remove). Lets the Resource Manager refresh the tree without polling.
     overlay_added = pyqtSignal(object)
@@ -425,6 +430,7 @@ class VideoPanel(QWidget):
         # their own fps and current_frame.
         if self._master_clock is not None:
             self._on_master_time_changed(self._master_clock.time)
+        self.fps_changed.emit(self._fps)
 
     def _on_cmap_changed(self, name: str) -> None:
         cmap = _make_colormap(name)

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .segmentation_panel import SegmentationPanel
 from .settings import get_last_dir, set_last_dir_from_path
 from .signal_panel import SignalPanel
 from .video_panel import VideoPanel
@@ -205,10 +206,23 @@ class ResourceManagerPanel(QWidget):
         super().__init__(parent)
         self._controller = controller
         self._panel_manager = panel_manager
+        # Coalesce bursts of refresh requests (e.g. box-selecting many neurons
+        # emits one signal per neuron) into a single rebuild on the next event
+        # loop turn.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(0)
+        self._refresh_timer.timeout.connect(self._refresh_tree)
         self._build_ui()
 
         panel_manager.on_added(self._on_panel_added)
         panel_manager.on_removed(self._on_panel_removed)
+
+    def _schedule_refresh(self) -> None:
+        try:
+            self._refresh_timer.start()
+        except RuntimeError:
+            pass
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -281,19 +295,64 @@ class ResourceManagerPanel(QWidget):
                         child = QTreeWidgetItem([f"[overlay {ov.kind}] {ov.name}"])
                         top.addChild(child)
 
-                    # ROIs grouped under a folder node; each ROI is its own child.
-                    folder = QTreeWidgetItem(["ROIs"])
-                    folder.setData(
-                        0, Qt.ItemDataRole.UserRole, ("roi_folder", entry.panel)
-                    )
-                    top.addChild(folder)
-                    for r in entry.panel.rois:
-                        node = QTreeWidgetItem([f"[ellipse] {r.name}"])
-                        node.setData(
-                            0, Qt.ItemDataRole.UserRole, ("roi", entry.panel, r.id)
+                    if isinstance(entry.panel, SegmentationPanel):
+                        # Selected neurons listed under per-selection-group
+                        # folders (single clicks → "Clicked"; each drag-box →
+                        # its own "Box N"). Selecting a node/folder emphasizes
+                        # those neurons on the canvas.
+                        seg = entry.panel.seg
+                        for gi, grp in enumerate(entry.panel.selection_groups()):
+                            neurons = sorted(grp["neurons"])
+                            if not neurons:
+                                continue  # hide empty groups (incl. default)
+                            folder = QTreeWidgetItem([f'{grp["name"]} ({len(neurons)})'])
+                            folder.setData(
+                                0,
+                                Qt.ItemDataRole.UserRole,
+                                ("seg_group", entry.panel, gi),
+                            )
+                            top.addChild(folder)
+                            for n in neurons:
+                                node = QTreeWidgetItem([f"neuron {n}"])
+                                node.setData(
+                                    0,
+                                    Qt.ItemDataRole.UserRole,
+                                    ("seg_neuron", entry.panel, n),
+                                )
+                                node.setForeground(0, QColor(*seg.neuron_color(n)))
+                                folder.addChild(node)
+                            folder.setExpanded(True)
+                        # Bad ROIs (hidden on the canvas) live in their own
+                        # folder; selecting one still emphasizes it so you can
+                        # locate it, and right-click restores it.
+                        bad = seg.bad_neurons()
+                        if bad:
+                            bad_folder = QTreeWidgetItem([f"Bad ({len(bad)})"])
+                            bad_folder.setData(
+                                0, Qt.ItemDataRole.UserRole, ("seg_bad_folder", entry.panel)
+                            )
+                            top.addChild(bad_folder)
+                            for n in bad:
+                                node = QTreeWidgetItem([f"neuron {n}"])
+                                node.setData(
+                                    0, Qt.ItemDataRole.UserRole, ("seg_bad", entry.panel, n)
+                                )
+                                node.setForeground(0, QColor(128, 128, 128))
+                                bad_folder.addChild(node)
+                    else:
+                        # ROIs grouped under a folder node; each ROI is its own child.
+                        folder = QTreeWidgetItem(["ROIs"])
+                        folder.setData(
+                            0, Qt.ItemDataRole.UserRole, ("roi_folder", entry.panel)
                         )
-                        folder.addChild(node)
-                    folder.setExpanded(True)
+                        top.addChild(folder)
+                        for r in entry.panel.rois:
+                            node = QTreeWidgetItem([f"[ellipse] {r.name}"])
+                            node.setData(
+                                0, Qt.ItemDataRole.UserRole, ("roi", entry.panel, r.id)
+                            )
+                            folder.addChild(node)
+                        folder.setExpanded(True)
                     top.setExpanded(True)
 
                 elif isinstance(entry.panel, SignalPanel):
@@ -345,12 +404,21 @@ class ResourceManagerPanel(QWidget):
         # overlay changes so we can refresh the tree without polling.
         if isinstance(entry.panel, VideoPanel):
             self._controller.add_panel(entry.panel)
-            entry.panel.overlay_added.connect(lambda *_: self._refresh_tree())
-            entry.panel.overlay_removed.connect(lambda *_: self._refresh_tree())
-            entry.panel.roi_added.connect(lambda *_: self._refresh_tree())
-            entry.panel.roi_removed.connect(lambda *_: self._refresh_tree())
+            entry.panel.overlay_added.connect(lambda *_: self._schedule_refresh())
+            entry.panel.overlay_removed.connect(lambda *_: self._schedule_refresh())
+            entry.panel.roi_added.connect(lambda *_: self._schedule_refresh())
+            entry.panel.roi_removed.connect(lambda *_: self._schedule_refresh())
+            if isinstance(entry.panel, SegmentationPanel):
+                # Re-grouping (box-select / clicks / clear) changes the tree's
+                # group folders; one signal per change, coalesced into one
+                # rebuild even when a box selects hundreds of neurons.
+                entry.panel.groups_changed.connect(lambda *_: self._schedule_refresh())
+                entry.panel.bad_changed.connect(lambda *_: self._schedule_refresh())
+                # Clicking empty video space clears the tree selection (and thus
+                # the white emphasis it drives).
+                entry.panel.emphasis_cleared.connect(self.tree.clearSelection)
         elif isinstance(entry.panel, SignalPanel):
-            entry.panel.traces_changed.connect(lambda *_: self._refresh_tree())
+            entry.panel.traces_changed.connect(lambda *_: self._schedule_refresh())
         self._refresh_tree()
 
     def _on_item_changed(self, item, column) -> None:
@@ -378,14 +446,100 @@ class ResourceManagerPanel(QWidget):
                 pairs.append((tag[1], tag[2]))
         return pairs
 
-    def _on_selection_changed(self) -> None:
-        # Highlight selected ROIs on each video's canvas; clear the rest.
+    @staticmethod
+    def _neuron_pair_of(tag) -> tuple | None:
+        """(SegmentationPanel, neuron_index) for a seg_neuron node or a companion
+        trace node; None for anything else."""
+        if tag[0] == "seg_neuron":
+            return (tag[1], tag[2])
+        if tag[0] == "trace":
+            seg_panel = getattr(tag[1], "segmentation_panel", None)
+            mapping = getattr(tag[1], "neuron_of_trace", None)
+            if seg_panel is not None and mapping and tag[2] in mapping:
+                return (seg_panel, mapping[tag[2]])
+        return None
+
+    def _selected_neuron_pairs(self) -> list[tuple]:
+        """(SegmentationPanel, neuron_index) for every selected neuron node
+        (folder node or companion trace node)."""
+        pairs = []
+        for item in self.tree.selectedItems():
+            tag = item.data(0, Qt.ItemDataRole.UserRole)
+            if tag:
+                pair = self._neuron_pair_of(tag)
+                if pair is not None:
+                    pairs.append(pair)
+        return pairs
+
+    def _selected_bad_pairs(self) -> list[tuple]:
+        """(SegmentationPanel, neuron_index) for every selected bad-ROI node."""
+        pairs = []
+        for item in self.tree.selectedItems():
+            tag = item.data(0, Qt.ItemDataRole.UserRole)
+            if tag and tag[0] == "seg_bad":
+                pairs.append((tag[1], tag[2]))
+        return pairs
+
+    @staticmethod
+    def _plot(pairs: list[tuple]) -> None:
         by_panel: dict = {}
+        for panel, n in pairs:
+            by_panel.setdefault(panel, []).append(n)
+        for panel, ns in by_panel.items():
+            panel.plot_neurons(ns)
+
+    @staticmethod
+    def _mark_bad(pairs: list[tuple]) -> None:
+        by_panel: dict = {}
+        for panel, n in pairs:
+            by_panel.setdefault(panel, []).append(n)
+        for panel, ns in by_panel.items():
+            panel.mark_bad(ns)
+
+    @staticmethod
+    def _mark_good(pairs: list[tuple]) -> None:
+        by_panel: dict = {}
+        for panel, n in pairs:
+            by_panel.setdefault(panel, []).append(n)
+        for panel, ns in by_panel.items():
+            panel.mark_good(ns)
+
+    def _on_selection_changed(self) -> None:
+        # Highlight selected ROIs (drawn-ellipse panels) and emphasize selected
+        # neurons (segmentation panels) on each canvas; clear the rest.
+        roi_by_panel: dict = {}
         for panel, rid in self._selected_roi_pairs():
-            by_panel.setdefault(panel, set()).add(rid)
+            roi_by_panel.setdefault(panel, set()).add(rid)
+
+        # Emphasis is driven by two kinds of selected node: a neuron under the
+        # segmentation panel's own "Neurons" folder, and a trace row under its
+        # companion "[signal] Neurons — …" panel (mapped back via the link
+        # MainWindow set on that panel).
+        neurons_by_panel: dict = {}
+        for item in self.tree.selectedItems():
+            tag = item.data(0, Qt.ItemDataRole.UserRole)
+            if not tag:
+                continue
+            if tag[0] in ("seg_neuron", "seg_bad"):
+                neurons_by_panel.setdefault(tag[1], set()).add(tag[2])
+            elif tag[0] == "seg_group":
+                groups = tag[1].selection_groups()
+                if 0 <= tag[2] < len(groups):
+                    neurons_by_panel.setdefault(tag[1], set()).update(
+                        groups[tag[2]]["neurons"]
+                    )
+            elif tag[0] == "trace":
+                seg_panel = getattr(tag[1], "segmentation_panel", None)
+                mapping = getattr(tag[1], "neuron_of_trace", None)
+                if seg_panel is not None and mapping and tag[2] in mapping:
+                    neurons_by_panel.setdefault(seg_panel, set()).add(mapping[tag[2]])
+
         for entry in self._panel_manager.entries:
-            if isinstance(entry.panel, VideoPanel):
-                entry.panel.set_roi_highlight(by_panel.get(entry.panel, set()))
+            panel = entry.panel
+            if isinstance(panel, SegmentationPanel):
+                panel.set_neuron_highlight(neurons_by_panel.get(panel, set()))
+            elif isinstance(panel, VideoPanel):
+                panel.set_roi_highlight(roi_by_panel.get(panel, set()))
 
     def _on_context_menu(self, pos) -> None:
         item = self.tree.itemAt(pos)
@@ -419,6 +573,49 @@ class ResourceManagerPanel(QWidget):
             menu.addAction("Properties…", lambda: self._edit_roi_properties(pairs))
             if len(pairs) == 1:
                 menu.addAction("Rename…", lambda: self._rename_roi(pairs[0]))
+        elif tag[0] == "seg_group":
+            panel, gi = tag[1], tag[2]
+            groups = panel.selection_groups()
+            neurons = sorted(groups[gi]["neurons"]) if 0 <= gi < len(groups) else []
+            menu.addAction(
+                f"Plot traces ({len(neurons)})",
+                lambda p=panel, ns=neurons: p.plot_neurons(ns),
+            )
+            menu.addAction(
+                f"Deselect group ({len(neurons)})",
+                lambda p=panel, g=gi: p.deselect_group(g),
+            )
+            menu.addAction("Clear all selection", panel.clear_selection)
+        elif tag[0] in ("seg_neuron", "trace"):
+            # Deselect the neuron(s) of the right-clicked selection — from either
+            # the segmentation panel's Neurons folder or its companion trace plot.
+            pairs = self._selected_neuron_pairs()
+            here = self._neuron_pair_of(tag)
+            if here is not None and here not in pairs:
+                pairs = [here]
+            if pairs:
+                menu.addAction(
+                    f"Plot trace(s) ({len(pairs)})", lambda ps=pairs: self._plot(ps)
+                )
+                menu.addAction(
+                    f"Deselect ({len(pairs)})",
+                    lambda ps=pairs: [p.set_neuron_selected(n, False) for p, n in ps],
+                )
+                menu.addAction(
+                    f"Mark as bad ({len(pairs)})", lambda ps=pairs: self._mark_bad(ps)
+                )
+        elif tag[0] == "seg_bad":
+            pairs = self._selected_bad_pairs()
+            if (tag[1], tag[2]) not in pairs:
+                pairs = [(tag[1], tag[2])]
+            menu.addAction(
+                f"Mark good ({len(pairs)})", lambda ps=pairs: self._mark_good(ps)
+            )
+        elif tag[0] == "seg_bad_folder":
+            panel = tag[1]
+            menu.addAction(
+                "Restore all", lambda p=panel: p.mark_good(p.seg.bad_neurons())
+            )
 
         if menu.actions():
             menu.exec(self.tree.viewport().mapToGlobal(pos))

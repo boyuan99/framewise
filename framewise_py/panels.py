@@ -24,6 +24,8 @@ from PyQt6.QtWidgets import (
 
 from .loaders import is_tdt_path, load, load_tdt
 from .master_clock import MasterClock
+from .segmentation import is_segmentation_dir, load_segmentation
+from .segmentation_panel import SegmentationPanel
 from .signal_panel import SignalPanel
 from .video_panel import VideoPanel
 
@@ -141,8 +143,11 @@ class PanelManager:
         self._on_removed_callbacks.append(callback)
 
     def add(self, path: str | Path) -> PanelEntry:
-        """Dispatch by path type: TDT block dir → SignalPanel; else VideoPanel."""
+        """Dispatch by path type: segmentation result dir → SegmentationPanel;
+        TDT block dir → SignalPanel; else VideoPanel."""
         path = Path(path)
+        if is_segmentation_dir(path):
+            return self.add_segmentation(path)
         if is_tdt_path(path):
             return self.add_signals(path)
         return self.add_video(path)
@@ -158,6 +163,12 @@ class PanelManager:
         traces, name = load_tdt(path)
         panel = SignalPanel(name=name, traces=traces)
         return self._register(panel, name, path, "signal")
+
+    def add_segmentation(self, path: str | Path) -> PanelEntry:
+        path = Path(path)
+        seg = load_segmentation(path)
+        panel = SegmentationPanel(seg)
+        return self._register(panel, seg.name, path, "segmentation")
 
     def register_signal_panel(self, panel: SignalPanel, name: str) -> PanelEntry:
         """Register a pre-built SignalPanel (e.g. ROI ΔF/F) with no source file.
