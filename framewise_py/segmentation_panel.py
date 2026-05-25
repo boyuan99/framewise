@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QEvent, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -40,7 +41,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .segmentation import SegmentationResult
+from .segmentation import CELL_LABELS, SegmentationResult
 from .video_panel import VideoPanel
 
 # Alpha applied to a selected neuron's footprint on the highlight layer.
@@ -49,6 +50,10 @@ _HIGHLIGHT_ALPHA = 255
 # Box-select auto-plots companion traces only up to this many neurons; larger
 # boxes select/group without plotting (the user plots specific ones on demand).
 _AUTOPLOT_LIMIT = 5
+
+# How many label operations the per-panel undo stack remembers (each entry is a
+# small {neuron: old_label} diff, so this is cheap; the cap just bounds memory).
+_UNDO_DEPTH = 100
 
 
 class SegmentationPanel(VideoPanel):
@@ -66,9 +71,9 @@ class SegmentationPanel(VideoPanel):
     # groups are pruned) so the Resource Manager refreshes its group folders.
     groups_changed = pyqtSignal()
 
-    # Emitted when the set of bad ROIs changes (mark/unmark) so the Resource
-    # Manager refreshes its "Bad" folder.
-    bad_changed = pyqtSignal()
+    # Emitted when any neuron's cell-type label changes (incl. bad) so the
+    # Resource Manager refreshes its "Cell types" classification folders.
+    labels_changed = pyqtSignal()
 
     def __init__(
         self,
@@ -84,6 +89,9 @@ class SegmentationPanel(VideoPanel):
         # Neurons emphasized from the Resource Manager (tree selection) — drawn
         # bright white on top so you can tell which tree row maps to which cell.
         self._emph: set[int] = set()
+        # Undo stack for label edits: each entry is a {neuron: previous_label}
+        # diff, restored (newest first) by `undo_last_label` / Ctrl+Z.
+        self._undo_stack: list[dict] = []
         # Drag-box selection state (active while the "▭ Box" button is toggled on).
         self._box_mode = False
         self._box_start: tuple[float, float] | None = None
@@ -208,8 +216,8 @@ class SegmentationPanel(VideoPanel):
 
         self.cb_show_bad = QCheckBox("Show bad")
         self.cb_show_bad.setToolTip(
-            "Show ROIs marked bad (gray). They're hidden by default; mark/restore "
-            "via right-click in the Resource Manager."
+            "Show ROIs labeled bad (gray). They're hidden by default; label/restore "
+            "via the Label dropdown or right-click in the Resource Manager."
         )
         self.cb_show_bad.toggled.connect(self._on_show_bad_toggled)
         row.addWidget(self.cb_show_bad)
@@ -257,6 +265,31 @@ class SegmentationPanel(VideoPanel):
         )
         self.btn_box.toggled.connect(self._on_box_toggled)
         row.addWidget(self.btn_box)
+
+        # Cell-type labeling: picking a label applies it to the current
+        # selection immediately. Also doubles as a live readout of the selected
+        # cell's type (see _sync_label_combo). Labels persist only on File → Save.
+        row.addWidget(QLabel("Label"))
+        self.label_combo = QComboBox()
+        self.label_combo.addItems(list(CELL_LABELS))
+        self.label_combo.setToolTip(
+            "Pick a cell type to apply it to the selected neurons immediately "
+            "(default unknown; 'bad' hides them). Save via File → Save Labels."
+        )
+        # textActivated fires only on user choice, not programmatic setCurrentIndex
+        # in _sync_label_combo — so the live readout never re-applies a label.
+        self.label_combo.textActivated.connect(self._apply_label_to_selection)
+        row.addWidget(self.label_combo)
+
+        # Undo the last label edit (mistyped labels are the common case). Per-panel
+        # stack; Ctrl+Z fires while this panel/its canvas has focus.
+        self.btn_undo = QPushButton("↶ Undo")
+        self.btn_undo.setToolTip("Undo the last label change (Ctrl+Z)")
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.clicked.connect(self.undo_last_label)
+        row.addWidget(self.btn_undo)
+        undo_sc = QShortcut(QKeySequence.StandardKey.Undo, self)
+        undo_sc.activated.connect(self.undo_last_label)
 
         self.lbl_hover = QLabel("Hover: —")
         self.lbl_hover.setStyleSheet("color: #777;")
@@ -323,7 +356,7 @@ class SegmentationPanel(VideoPanel):
         img = self._seg.label_image(self._current_fp_mode())
         self._fp_item.setImage(self._normalize_frame_layout(img), autoLevels=False)
 
-    # ----- bad-ROI marking -----
+    # ----- cell-type labeling -----
 
     def _on_show_bad_toggled(self, on: bool) -> None:
         self._bad_item.setVisible(bool(on))
@@ -332,32 +365,118 @@ class SegmentationPanel(VideoPanel):
                 self._normalize_frame_layout(self._seg.bad_image()), autoLevels=False
             )
 
+    def _apply_label_to_selection(self, label: str) -> None:
+        """Apply the just-picked label to every currently-selected neuron."""
+        sel = self.selected_neurons
+        if not sel:
+            self.roi_status.emit("No neurons selected — click or box-select first.")
+            return
+        self.set_labels(sel, label)
+
+    def _sync_label_combo(self, active: int | None = None) -> None:
+        """Reflect the current neuron's label in the dropdown, so the combo
+        doubles as a live readout of "what type is this cell?".
+
+        `active` is the neuron just clicked/emphasized — when given, its label
+        always wins (so the combo tracks the cell you're looking at, even within
+        a mixed-label multi-selection). Otherwise it shows the focused neurons'
+        common label, or is left unchanged when the focus is empty/mixed."""
+        if not hasattr(self, "label_combo"):
+            return  # controls not built yet (early _refresh_* during __init__)
+        if active is not None:
+            label = self._seg.label_of(int(active))
+        else:
+            labels = {self._seg.label_of(n) for n in (self._selected | self._emph)}
+            if len(labels) != 1:
+                return
+            label = next(iter(labels))
+        i = self.label_combo.findText(label)
+        if i >= 0 and i != self.label_combo.currentIndex():
+            self.label_combo.setCurrentIndex(i)
+
+    def set_labels(self, neurons, label: str) -> None:
+        """Set one cell-type label on neurons (in memory; persist via File → Save).
+        Labeling neurons "bad" also drops them from the selection (and their
+        companion traces), since bad neurons are hidden from the canvas.
+
+        Batched: the selection is updated in bulk and the canvas repaints once,
+        so labeling a large box-selection is O(N), not O(N²) repaints. Recorded
+        on the undo stack."""
+        self._apply_label_map({int(n): label for n in neurons}, record=True)
+
+    def _apply_label_map(self, mapping: dict, record: bool) -> None:
+        """Apply a {neuron: label} map in one batch, repainting once. Any neuron
+        becoming "bad" is bulk-deselected. When `record`, the inverse diff (each
+        neuron's previous label) is pushed onto the undo stack so it can be
+        reverted; undo itself calls this with record=False."""
+        before: dict[int, str] = {}
+        for n, lab in mapping.items():
+            n = int(n)
+            old = self._seg.label_of(n)
+            if old == lab:
+                continue
+            if self._seg.set_label(n, lab):
+                before[n] = old
+        if not before:
+            return
+        bad_now = [n for n in before if self._seg.label_of(n) == "bad"]
+        if bad_now:
+            self._deselect_many(bad_now)
+        if record:
+            self._undo_stack.append(before)
+            del self._undo_stack[:-_UNDO_DEPTH]  # bound the stack
+        self._after_label_change()
+
+    def undo_last_label(self) -> None:
+        """Revert the most recent label edit (restoring each neuron's prior
+        label). Selection is not restored — only the persisted labels."""
+        if not self._undo_stack:
+            self.roi_status.emit("Nothing to undo.")
+            return
+        diff = self._undo_stack.pop()
+        self._apply_label_map(diff, record=False)
+        self.roi_status.emit(f"Undid label change ({len(diff)} neuron(s)).")
+
+    def _deselect_many(self, neurons) -> None:
+        """Remove `neurons` from every selection group + emphasis in one pass.
+        Detaches each one's companion trace (cheap; a no-op when not plotted) and
+        repaints the tree once. Does NOT repaint the highlight layer — the caller
+        does that once afterwards."""
+        drop = {n for n in neurons if self._is_selected(n)}
+        emph_drop = self._emph & set(neurons)
+        if not drop and not emph_drop:
+            return
+        for g in self._groups:
+            g["neurons"].difference_update(drop)
+        self._prune_groups()
+        if emph_drop:
+            self._emph.difference_update(emph_drop)
+            self._refresh_emphasis()
+        for n in drop:  # detach companion traces (per-neuron by contract)
+            self.neuron_toggled.emit(n, False)
+        self.lbl_selected.setText(self._selected_text())
+        self.groups_changed.emit()
+
     def mark_bad(self, neurons) -> None:
-        """Mark neurons bad: deselect them, hide them, and persist the list."""
-        changed = False
-        for n in [int(x) for x in neurons]:
-            self._apply_select(n, False)  # drop from selection + companion trace
-            changed |= self._seg.set_bad(n, True)
-        if changed:
-            self._after_bad_change()
+        """Label neurons bad (deselect + hide). Persist via File → Save."""
+        self.set_labels(neurons, "bad")
 
     def mark_good(self, neurons) -> None:
-        """Restore neurons (unmark bad) and show them again."""
-        changed = False
-        for n in [int(x) for x in neurons]:
-            changed |= self._seg.set_bad(n, False)
-        if changed:
-            self._after_bad_change()
+        """Restore neurons to "unknown" and show them again."""
+        self.set_labels(neurons, "unknown")
 
-    def _after_bad_change(self) -> None:
-        self._seg.save_bad()
+    def _after_label_change(self) -> None:
+        # No disk write — labels persist only on File → Save (save_labels()).
         self._rebuild_footprint_overlay()
         if self.cb_show_bad.isChecked():
             self._bad_item.setImage(
                 self._normalize_frame_layout(self._seg.bad_image()), autoLevels=False
             )
         self._refresh_highlight()
-        self.bad_changed.emit()
+        self._sync_label_combo()
+        if hasattr(self, "btn_undo"):
+            self.btn_undo.setEnabled(bool(self._undo_stack))
+        self.labels_changed.emit()
 
     # ----- hover + select-by-id -----
 
@@ -530,6 +649,8 @@ class SegmentationPanel(VideoPanel):
                 self._refresh_emphasis()
         self._refresh_highlight()
         self.lbl_selected.setText(self._selected_text())
+        # Selecting a cell → show its label; deselecting → fall back to the rest.
+        self._sync_label_combo(n if selected else None)
         self.neuron_toggled.emit(n, selected)
         self.groups_changed.emit()
 
@@ -565,6 +686,7 @@ class SegmentationPanel(VideoPanel):
             )
         self._refresh_highlight()
         self.lbl_selected.setText(self._selected_text())
+        self._sync_label_combo()
         self.groups_changed.emit()
 
     def plot_neurons(self, neurons) -> None:
@@ -602,6 +724,7 @@ class SegmentationPanel(VideoPanel):
         self._refresh_highlight()
         self._refresh_emphasis()
         self.lbl_selected.setText(self._selected_text())
+        self._sync_label_combo()
         self.groups_changed.emit()
 
     def set_neuron_highlight(self, indices: set[int]) -> None:
@@ -609,12 +732,15 @@ class SegmentationPanel(VideoPanel):
         drawn bright white on top of the colored highlight."""
         self._emph = {int(n) for n in indices}
         self._refresh_emphasis()
+        # A single emphasized cell (one tree row) drives the combo to its label.
+        self._sync_label_combo(next(iter(self._emph)) if len(self._emph) == 1 else None)
 
     def clear_emphasis(self) -> None:
         """Drop the white emphasis (keeps neuron selections intact)."""
         if self._emph:
             self._emph = set()
             self._refresh_emphasis()
+            self._sync_label_combo()
 
     def _refresh_emphasis(self) -> None:
         H, W = self._seg.H, self._seg.W

@@ -68,6 +68,20 @@ _LABEL_ALPHA = 170
 
 _CACHE_NAME = "footprints_A.npz"
 
+# Per-neuron cell-type labels. "unknown" is the default (every neuron starts
+# here); "bad" keeps the special hide-from-canvas behavior (excluded from the
+# colored overlay + hit-testing). The rest are cell-type classes used for
+# downstream analysis. Labels are non-destructive — the footprints/traces stay
+# in the source data; only this assignment is persisted (to `cell_labels.json`,
+# explicitly via File → Save, never auto-saved).
+CELL_LABELS = ("unknown", "PV", "CHI", "D1", "D2", "bad")
+DEFAULT_LABEL = "unknown"
+
+# Legacy file: a plain bad-ROI list, superseded by `cell_labels.json`. Still read
+# once on load to migrate old marks (each listed index becomes label "bad").
+_BAD_LEGACY_NAME = "bad_rois.json"
+_LABELS_NAME = "cell_labels.json"
+
 
 class SegmentationLoadError(Exception):
     pass
@@ -117,11 +131,14 @@ class SegmentationResult:
     label_rgba: np.ndarray
     label_idx: np.ndarray
     colors: np.ndarray  # (N, 3) uint8, color assigned to each neuron
-    # 0-based indices of ROIs marked "bad". Persisted to `bad_path`
-    # (SEG/bad_rois.json); excluded from display + hit-testing by default. This
-    # is non-destructive — the footprints/traces stay in the source data.
-    bad: set = field(default_factory=set)
-    bad_path: "Path | None" = None
+    # Per-neuron cell-type label (length N, indexed by neuron id), one of
+    # `CELL_LABELS`; default "unknown". "bad" neurons are hidden from display +
+    # hit-testing (see `bad`). Labels persist to `label_path` (SEG/cell_labels.json)
+    # only on an explicit save (`save_labels()`), never automatically.
+    labels: list = field(default_factory=list)
+    label_path: "Path | None" = None
+    # Set by `set_label` when labels diverge from disk; cleared by `save_labels`.
+    labels_dirty: bool = field(default=False, repr=False)
     # Optional demixed temporal traces (from SEG_demix_validation/), index-
     # aligned with C: `C_demix[n]` is neuron n's demixed trace; `demixed[n]`
     # flags whether it was actually demixed. None when no demix data is present.
@@ -131,6 +148,16 @@ class SegmentationResult:
     @property
     def n_neurons(self) -> int:
         return int(self.A.shape[1])
+
+    @property
+    def bad(self) -> set:
+        """Set of neuron indices currently labeled "bad" (cached; invalidated by
+        `set_label`). These are hidden from the colored overlay + hit-testing."""
+        b = getattr(self, "_bad_cache", None)
+        if b is None:
+            b = {i for i, lab in enumerate(self.labels) if lab == "bad"}
+            self._bad_cache = b
+        return b
 
     @property
     def has_demix(self) -> bool:
@@ -216,35 +243,69 @@ class SegmentationResult:
         r, g, b = self.colors[n]
         return int(r), int(g), int(b)
 
-    # ----- bad-ROI marking (non-destructive, persisted to bad_path) -----
+    # ----- cell-type labels (non-destructive, persisted to label_path) -----
+
+    def label_of(self, n: int) -> str:
+        """The cell-type label of neuron n (one of `CELL_LABELS`)."""
+        return self.labels[int(n)]
+
+    def set_label(self, n: int, label: str) -> bool:
+        """Set neuron n's cell-type label (in memory). Returns True if it changed.
+        Invalidates the bad-set + display-image caches so overlays rebuild.
+        Persist explicitly via `save_labels()` — labels are never auto-saved."""
+        if label not in CELL_LABELS:
+            raise ValueError(f"Unknown cell-type label: {label!r}")
+        n = int(n)
+        changed = self.labels[n] != label
+        if changed:
+            self.labels[n] = label
+            self.labels_dirty = True
+            self._bad_cache = None  # bad membership may have changed
+            self._label_mode_cache = {}  # overlays rebuild without/with this cell
+        return changed
+
+    def neurons_with_label(self, label: str) -> list[int]:
+        """0-based indices of every neuron carrying `label` (ascending)."""
+        return [i for i, lab in enumerate(self.labels) if lab == label]
+
+    def label_counts(self) -> dict:
+        """{label: [neuron indices]} for each label that has at least one neuron."""
+        out: dict[str, list[int]] = {}
+        for i, lab in enumerate(self.labels):
+            out.setdefault(lab, []).append(i)
+        return out
+
+    def save_labels(self) -> bool:
+        """Persist per-neuron labels to SEG/cell_labels.json, writing an entry for
+        every neuron (default "unknown"). Returns True on success. Created on the
+        first save; non-fatal on failure (e.g. a read-only archive volume)."""
+        if self.label_path is None:
+            return False
+        try:
+            self.label_path.write_text(
+                json.dumps(
+                    {"labels": {str(i): lab for i, lab in enumerate(self.labels)}},
+                    indent=0,
+                )
+            )
+            self.labels_dirty = False
+            return True
+        except OSError as exc:
+            print(f"segmentation: could not save {self.label_path} ({exc})")
+            return False
+
+    # ----- bad-ROI helpers (bad is just the "bad" label) -----
 
     def is_bad(self, n: int) -> bool:
-        return int(n) in self.bad
+        return self.labels[int(n)] == "bad"
 
     def bad_neurons(self) -> list[int]:
         return sorted(self.bad)
 
     def set_bad(self, n: int, bad: bool = True) -> bool:
-        """Mark/unmark neuron n bad (in memory). Returns True if it changed.
-        Invalidates the display-image cache so overlays rebuild without it.
-        Call `save_bad()` to persist."""
-        n = int(n)
-        changed = (n in self.bad) != bad
-        if changed:
-            (self.bad.add if bad else self.bad.discard)(n)
-            self._label_mode_cache = {}
-        return changed
-
-    def save_bad(self) -> None:
-        """Persist the bad set to SEG/bad_rois.json (non-fatal on failure)."""
-        if self.bad_path is None:
-            return
-        try:
-            self.bad_path.write_text(
-                json.dumps({"bad_neurons": sorted(self.bad)}, indent=0)
-            )
-        except OSError as exc:
-            print(f"segmentation: could not save {self.bad_path} ({exc})")
+        """Convenience: mark/unmark neuron n bad via its label. Unmarking resets
+        the label to "unknown". Returns True if it changed."""
+        return self.set_label(int(n), "bad" if bad else DEFAULT_LABEL)
 
     def _good_coo(self) -> tuple[np.ndarray, np.ndarray]:
         """(pixel_row, neuron_col) of A's nonzeros, excluding bad neurons,
@@ -261,7 +322,7 @@ class SegmentationResult:
         """Colored (H, W, 4) overlay of the *good* footprints in the requested
         render mode: ``"fill"`` (solid translucent), ``"outline"`` (contour), or
         ``"center"`` (a dot per neuron). Bad ROIs are excluded. Cached per mode;
-        the cache is cleared by `set_bad`."""
+        the cache is cleared by `set_label`."""
         cache = getattr(self, "_label_mode_cache", None)
         if cache is None:
             cache = {}
@@ -396,9 +457,10 @@ def load_segmentation(path: str | Path, fps: float | None = None) -> Segmentatio
     # --- optional rmbg movie (lazy concatenated blocks) ---
     video = _load_rmbg_movie(project_root)
 
-    # --- bad-ROI list (persisted beside the segmentation) ---
-    bad_path = seg / "bad_rois.json"
-    bad = _load_bad(bad_path, A.shape[1])
+    # --- cell-type labels (persisted beside the segmentation; legacy bad list
+    # migrated on first load) ---
+    label_path = seg / _LABELS_NAME
+    labels = _load_labels(label_path, seg / _BAD_LEGACY_NAME, A.shape[1])
 
     # --- optional demixed traces (SEG_demix_validation/) ---
     C_demix, demixed = _load_demix(
@@ -419,8 +481,8 @@ def load_segmentation(path: str | Path, fps: float | None = None) -> Segmentatio
         label_rgba=label_rgba,
         label_idx=label_idx,
         colors=colors,
-        bad=bad,
-        bad_path=bad_path,
+        labels=labels,
+        label_path=label_path,
         C_demix=C_demix,
         demixed=demixed,
     )
@@ -451,6 +513,30 @@ def _load_demix(path: Path, n_neurons: int, sio) -> tuple:
     except (OSError, ValueError, KeyError) as exc:
         print(f"segmentation: could not read {path} ({exc}); ignoring demix")
         return None, None
+
+
+def _load_labels(label_path: Path, bad_legacy: Path, n_neurons: int) -> list:
+    """Per-neuron cell-type labels (length n_neurons, default "unknown").
+
+    Reads SEG/cell_labels.json when present. Otherwise migrates a legacy
+    SEG/bad_rois.json (each listed index becomes label "bad"). Every neuron gets
+    a label; unknown/out-of-range entries fall back to the default."""
+    labels = [DEFAULT_LABEL] * n_neurons
+    if label_path.exists():
+        try:
+            data = json.loads(label_path.read_text())
+            raw = data.get("labels", {}) if isinstance(data, dict) else {}
+            for k, v in raw.items():
+                i = int(k)
+                if 0 <= i < n_neurons and v in CELL_LABELS:
+                    labels[i] = v
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"segmentation: could not read {label_path} ({exc}); ignoring")
+        return labels
+    # No labels file yet — migrate any legacy bad-ROI list into "bad" labels.
+    for i in _load_bad(bad_legacy, n_neurons):
+        labels[i] = "bad"
+    return labels
 
 
 def _load_bad(path: Path, n_neurons: int) -> set:

@@ -37,7 +37,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .segmentation import CELL_LABELS
 from .segmentation_panel import SegmentationPanel
+
+# Cell-type folders larger than this are populated on expand rather than on
+# every tree rebuild, so clicking around a segmentation with thousands of
+# (mostly "unknown") neurons stays responsive.
+_LAZY_CELLTYPE_LIMIT = 200
 from .settings import get_last_dir, set_last_dir_from_path
 from .signal_panel import SignalPanel
 from .video_panel import VideoPanel
@@ -232,9 +238,12 @@ class ResourceManagerPanel(QWidget):
         self.tree.setColumnCount(1 + self._controller.n_groups)
         self.tree.setHeaderLabels(self._header_labels())
         header = self.tree.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for i in range(1, self.tree.columnCount()):
-            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        # Interactive (not Stretch/ResizeToContents) so the user can drag the
+        # dividers; give the Resource column a usable default width. New group
+        # columns added later inherit Interactive (the default mode).
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+        self.tree.setColumnWidth(0, 220)
         self.tree.setRootIsDecorated(True)
         # ROI management lives here: multi-select nodes + right-click actions.
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -243,6 +252,8 @@ class ResourceManagerPanel(QWidget):
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         # Trace-visibility checkboxes on signal-panel children flow through here.
         self.tree.itemChanged.connect(self._on_item_changed)
+        # Big cell-type folders (e.g. "unknown") populate their neurons on expand.
+        self.tree.itemExpanded.connect(self._on_item_expanded)
         layout.addWidget(self.tree, stretch=1)
 
         btn_row = QHBoxLayout()
@@ -322,23 +333,12 @@ class ResourceManagerPanel(QWidget):
                                 node.setForeground(0, QColor(*seg.neuron_color(n)))
                                 folder.addChild(node)
                             folder.setExpanded(True)
-                        # Bad ROIs (hidden on the canvas) live in their own
-                        # folder; selecting one still emphasizes it so you can
-                        # locate it, and right-click restores it.
-                        bad = seg.bad_neurons()
-                        if bad:
-                            bad_folder = QTreeWidgetItem([f"Bad ({len(bad)})"])
-                            bad_folder.setData(
-                                0, Qt.ItemDataRole.UserRole, ("seg_bad_folder", entry.panel)
-                            )
-                            top.addChild(bad_folder)
-                            for n in bad:
-                                node = QTreeWidgetItem([f"neuron {n}"])
-                                node.setData(
-                                    0, Qt.ItemDataRole.UserRole, ("seg_bad", entry.panel, n)
-                                )
-                                node.setForeground(0, QColor(128, 128, 128))
-                                bad_folder.addChild(node)
+                        # Cell-type classification — a separate view from the
+                        # selection groups above. One sub-folder per non-empty,
+                        # non-"unknown" label (PV/CHI/D1/D2/bad). Selecting a node
+                        # emphasizes it on the canvas (bad ones too, so you can
+                        # still locate them); right-click changes the label.
+                        self._add_celltype_section(top, entry.panel, seg)
                     else:
                         # ROIs grouped under a folder node; each ROI is its own child.
                         folder = QTreeWidgetItem(["ROIs"])
@@ -399,6 +399,70 @@ class ResourceManagerPanel(QWidget):
         h.addWidget(cb, alignment=Qt.AlignmentFlag.AlignCenter)
         return container
 
+    def _add_celltype_section(self, top: QTreeWidgetItem, panel, seg) -> None:
+        """Build the "Cell types" folder: every neuron grouped by its label
+        (one sub-folder per non-empty label, including "unknown"). This is the
+        always-present all-neurons view, kept separate from the selection groups.
+
+        Large folders (typically the "unknown" bulk) are populated on expand —
+        see `_on_item_expanded` — so rebuilds stay snappy with thousands of cells."""
+        counts = seg.label_counts()
+        if not any(counts.get(lab) for lab in CELL_LABELS):
+            return
+        ct_root = QTreeWidgetItem([f"Cell types ({seg.n_neurons})"])
+        ct_root.setData(0, Qt.ItemDataRole.UserRole, ("seg_celltype_root", panel))
+        top.addChild(ct_root)
+        for lab in CELL_LABELS:
+            neurons = counts.get(lab, [])
+            if not neurons:
+                continue
+            folder = QTreeWidgetItem([f"{lab} ({len(neurons)})"])
+            folder.setData(
+                0, Qt.ItemDataRole.UserRole, ("seg_label_folder", panel, lab)
+            )
+            ct_root.addChild(folder)
+            if len(neurons) > _LAZY_CELLTYPE_LIMIT:
+                # Defer: a placeholder gives the folder an expand arrow; the
+                # real nodes are built when the user expands it.
+                placeholder = QTreeWidgetItem(["… expand to load"])
+                placeholder.setData(
+                    0, Qt.ItemDataRole.UserRole, ("seg_label_lazy", panel, lab)
+                )
+                folder.addChild(placeholder)
+                folder.setExpanded(False)
+            else:
+                for n in neurons:
+                    self._add_labeled_neuron_node(folder, panel, seg, lab, n)
+                folder.setExpanded(True)
+        ct_root.setExpanded(True)
+
+    @staticmethod
+    def _add_labeled_neuron_node(folder, panel, seg, label: str, n: int) -> None:
+        """Add one neuron leaf under a cell-type folder (gray for bad)."""
+        node = QTreeWidgetItem([f"neuron {n}"])
+        node.setData(0, Qt.ItemDataRole.UserRole, ("seg_labeled", panel, n))
+        color = QColor(128, 128, 128) if label == "bad" else QColor(*seg.neuron_color(n))
+        node.setForeground(0, color)
+        folder.addChild(node)
+
+    def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
+        """Populate a lazily-deferred cell-type folder on first expand (replacing
+        its '… expand to load' placeholder with the real neuron nodes)."""
+        if item.childCount() != 1:
+            return
+        tag = item.child(0).data(0, Qt.ItemDataRole.UserRole)
+        if not tag or tag[0] != "seg_label_lazy":
+            return
+        _, panel, label = tag
+        item.removeChild(item.child(0))
+        seg = panel.seg
+        self.tree.blockSignals(True)  # adding children must not re-fire handlers
+        try:
+            for n in seg.neurons_with_label(label):
+                self._add_labeled_neuron_node(item, panel, seg, label, n)
+        finally:
+            self.tree.blockSignals(False)
+
     def _on_panel_added(self, entry: "PanelEntry") -> None:
         # Sync grouping currently only applies to VideoPanels. Subscribe to
         # overlay changes so we can refresh the tree without polling.
@@ -413,7 +477,7 @@ class ResourceManagerPanel(QWidget):
                 # group folders; one signal per change, coalesced into one
                 # rebuild even when a box selects hundreds of neurons.
                 entry.panel.groups_changed.connect(lambda *_: self._schedule_refresh())
-                entry.panel.bad_changed.connect(lambda *_: self._schedule_refresh())
+                entry.panel.labels_changed.connect(lambda *_: self._schedule_refresh())
                 # Clicking empty video space clears the tree selection (and thus
                 # the white emphasis it drives).
                 entry.panel.emphasis_cleared.connect(self.tree.clearSelection)
@@ -448,9 +512,9 @@ class ResourceManagerPanel(QWidget):
 
     @staticmethod
     def _neuron_pair_of(tag) -> tuple | None:
-        """(SegmentationPanel, neuron_index) for a seg_neuron node or a companion
-        trace node; None for anything else."""
-        if tag[0] == "seg_neuron":
+        """(SegmentationPanel, neuron_index) for a seg_neuron / seg_labeled node
+        or a companion trace node; None for anything else."""
+        if tag[0] in ("seg_neuron", "seg_labeled"):
             return (tag[1], tag[2])
         if tag[0] == "trace":
             seg_panel = getattr(tag[1], "segmentation_panel", None)
@@ -471,15 +535,6 @@ class ResourceManagerPanel(QWidget):
                     pairs.append(pair)
         return pairs
 
-    def _selected_bad_pairs(self) -> list[tuple]:
-        """(SegmentationPanel, neuron_index) for every selected bad-ROI node."""
-        pairs = []
-        for item in self.tree.selectedItems():
-            tag = item.data(0, Qt.ItemDataRole.UserRole)
-            if tag and tag[0] == "seg_bad":
-                pairs.append((tag[1], tag[2]))
-        return pairs
-
     @staticmethod
     def _plot(pairs: list[tuple]) -> None:
         by_panel: dict = {}
@@ -489,20 +544,13 @@ class ResourceManagerPanel(QWidget):
             panel.plot_neurons(ns)
 
     @staticmethod
-    def _mark_bad(pairs: list[tuple]) -> None:
+    def _set_label(pairs: list[tuple], label: str) -> None:
+        """Apply `label` to every (panel, neuron) pair, batched per panel."""
         by_panel: dict = {}
         for panel, n in pairs:
             by_panel.setdefault(panel, []).append(n)
         for panel, ns in by_panel.items():
-            panel.mark_bad(ns)
-
-    @staticmethod
-    def _mark_good(pairs: list[tuple]) -> None:
-        by_panel: dict = {}
-        for panel, n in pairs:
-            by_panel.setdefault(panel, []).append(n)
-        for panel, ns in by_panel.items():
-            panel.mark_good(ns)
+            panel.set_labels(ns, label)
 
     def _on_selection_changed(self) -> None:
         # Highlight selected ROIs (drawn-ellipse panels) and emphasize selected
@@ -520,7 +568,7 @@ class ResourceManagerPanel(QWidget):
             tag = item.data(0, Qt.ItemDataRole.UserRole)
             if not tag:
                 continue
-            if tag[0] in ("seg_neuron", "seg_bad"):
+            if tag[0] in ("seg_neuron", "seg_labeled"):
                 neurons_by_panel.setdefault(tag[1], set()).add(tag[2])
             elif tag[0] == "seg_group":
                 groups = tag[1].selection_groups()
@@ -528,6 +576,10 @@ class ResourceManagerPanel(QWidget):
                     neurons_by_panel.setdefault(tag[1], set()).update(
                         groups[tag[2]]["neurons"]
                     )
+            elif tag[0] == "seg_label_folder":
+                neurons_by_panel.setdefault(tag[1], set()).update(
+                    tag[1].seg.neurons_with_label(tag[2])
+                )
             elif tag[0] == "trace":
                 seg_panel = getattr(tag[1], "segmentation_panel", None)
                 mapping = getattr(tag[1], "neuron_of_trace", None)
@@ -586,9 +638,11 @@ class ResourceManagerPanel(QWidget):
                 lambda p=panel, g=gi: p.deselect_group(g),
             )
             menu.addAction("Clear all selection", panel.clear_selection)
-        elif tag[0] in ("seg_neuron", "trace"):
-            # Deselect the neuron(s) of the right-clicked selection — from either
-            # the segmentation panel's Neurons folder or its companion trace plot.
+            self._add_set_label_menu(menu, [(panel, n) for n in neurons])
+        elif tag[0] in ("seg_neuron", "trace", "seg_labeled"):
+            # Act on the neuron(s) of the right-clicked selection — from the
+            # segmentation panel's selection folders, the cell-type folders, or
+            # a companion trace plot.
             pairs = self._selected_neuron_pairs()
             here = self._neuron_pair_of(tag)
             if here is not None and here not in pairs:
@@ -601,24 +655,29 @@ class ResourceManagerPanel(QWidget):
                     f"Deselect ({len(pairs)})",
                     lambda ps=pairs: [p.set_neuron_selected(n, False) for p, n in ps],
                 )
-                menu.addAction(
-                    f"Mark as bad ({len(pairs)})", lambda ps=pairs: self._mark_bad(ps)
-                )
-        elif tag[0] == "seg_bad":
-            pairs = self._selected_bad_pairs()
-            if (tag[1], tag[2]) not in pairs:
-                pairs = [(tag[1], tag[2])]
-            menu.addAction(
-                f"Mark good ({len(pairs)})", lambda ps=pairs: self._mark_good(ps)
-            )
-        elif tag[0] == "seg_bad_folder":
-            panel = tag[1]
-            menu.addAction(
-                "Restore all", lambda p=panel: p.mark_good(p.seg.bad_neurons())
+                self._add_set_label_menu(menu, pairs)
+        elif tag[0] == "seg_label_folder":
+            # The whole cell-type folder: relabel every neuron in it at once.
+            panel, lab = tag[1], tag[2]
+            neurons = panel.seg.neurons_with_label(lab)
+            self._add_set_label_menu(
+                menu, [(panel, n) for n in neurons], title="Set all to"
             )
 
         if menu.actions():
             menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _add_set_label_menu(
+        self, menu: QMenu, pairs: list[tuple], title: str = "Set label"
+    ) -> None:
+        """Add a 'Set label ▸ {PV/CHI/D1/D2/unknown/bad}' submenu acting on
+        `pairs`. No-op (disabled) when there are no neurons to label."""
+        sub = menu.addMenu(f"{title} ({len(pairs)})")
+        sub.setEnabled(bool(pairs))
+        for lab in CELL_LABELS:
+            sub.addAction(
+                lab, lambda checked=False, l=lab, ps=pairs: self._set_label(ps, l)
+            )
 
     def _extract_selected(self, pairs: list[tuple]) -> None:
         by_panel: dict = {}

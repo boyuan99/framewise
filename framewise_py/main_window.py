@@ -162,6 +162,16 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        act_save = QAction("&Save Labels", self)
+        act_save.setShortcut("Ctrl+S")
+        act_save.setToolTip(
+            "Save cell-type labels for all open segmentations to SEG/cell_labels.json"
+        )
+        act_save.triggered.connect(self._save_labels)
+        file_menu.addAction(act_save)
+
+        file_menu.addSeparator()
+
         act_quit = QAction("&Quit", self)
         act_quit.setShortcut("Ctrl+Q")
         act_quit.triggered.connect(self.close)
@@ -291,6 +301,36 @@ class MainWindow(QMainWindow):
         if path:
             set_last_dir_from_path(path)
             self.add_video(path)
+
+    def _save_labels(self) -> None:
+        """Write cell-type labels for every open segmentation to its
+        SEG/cell_labels.json (created on first save; an entry per neuron)."""
+        segs = [e for e in self.panel_manager.entries if e.kind == "segmentation"]
+        if not segs:
+            QMessageBox.information(
+                self, "Save Labels", "No segmentation is open to save labels for."
+            )
+            return
+        saved, failed = [], []
+        for e in segs:
+            seg = e.panel.seg
+            if seg.save_labels():
+                saved.append(f"{seg.name} → {seg.label_path}")
+            else:
+                failed.append(seg.name)
+        if failed:
+            QMessageBox.warning(
+                self,
+                "Save Labels",
+                "Could not save labels for:\n  " + "\n  ".join(failed)
+                + "\n\n(The destination may be read-only.)",
+            )
+        if saved:
+            self.statusBar().showMessage(
+                f"Saved labels for {len(saved)} segmentation(s): "
+                + "; ".join(saved),
+                6000,
+            )
 
     # ----- Playback -----
 
