@@ -17,16 +17,48 @@ from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtWidgets import QLabel, QStackedLayout, QWidget
 
 try:
+    from PyQt6.QtWebEngineCore import QWebEngineScript
     from PyQt6.QtWebEngineWidgets import QWebEngineView
 
     WEBENGINE_AVAILABLE = True
 except Exception:  # ImportError, or missing native libs
+    QWebEngineScript = None  # type: ignore[assignment]
     QWebEngineView = None  # type: ignore[assignment]
     WEBENGINE_AVAILABLE = False
 
 
 _POLL_INTERVAL_MS = 500
 _READY_TIMEOUT_MS = 30_000
+
+# Forces the embedded Lab page to always report itself as visible. Without this,
+# QStackedWidget hiding the webview on a workspace switch flips
+# `document.hidden` to true, which makes Lab's frontend back off pollers and
+# (more importantly) ends up letting the server drop the external kernel from
+# `MultiKernelManager._kernels`. Because jupyter_client never clears its
+# `kernel_id_to_connection_file` mapping for removed externals, the kernel can
+# only be rediscovered after a full Lab restart — see
+# jupyter_client/multikernelmanager.py:list_kernel_ids.
+_ALWAYS_VISIBLE_JS = """
+(() => {
+  try {
+    Object.defineProperty(document, 'hidden',
+      { configurable: true, get: () => false });
+    Object.defineProperty(document, 'visibilityState',
+      { configurable: true, get: () => 'visible' });
+    Object.defineProperty(document, 'webkitHidden',
+      { configurable: true, get: () => false });
+    Object.defineProperty(document, 'webkitVisibilityState',
+      { configurable: true, get: () => 'visible' });
+    const blocked = new Set(['visibilitychange', 'webkitvisibilitychange',
+                             'pagehide', 'freeze']);
+    const origAdd = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function(type, listener, opts) {
+      if (blocked.has(type)) return;
+      return origAdd.call(this, type, listener, opts);
+    };
+  } catch (e) { /* best-effort shim */ }
+})();
+"""
 
 
 class NotebookPanel(QWidget):
@@ -42,6 +74,7 @@ class NotebookPanel(QWidget):
             raise RuntimeError("PyQt6-WebEngine is not installed")
 
         self._view = QWebEngineView(self)
+        self._install_always_visible_shim()
         self._status = QLabel("", self)
         self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._status.setStyleSheet("color: #888;")
@@ -73,6 +106,15 @@ class NotebookPanel(QWidget):
         self._show_status("")
 
     # ----- internals -----
+
+    def _install_always_visible_shim(self) -> None:
+        script = QWebEngineScript()
+        script.setName("framewise-always-visible")
+        script.setSourceCode(_ALWAYS_VISIBLE_JS)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        script.setRunsOnSubFrames(True)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        self._view.page().scripts().insert(script)
 
     def _show_status(self, text: str) -> None:
         self._status.setText(text)

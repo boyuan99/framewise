@@ -499,13 +499,22 @@ class JupyterLabLauncher:
         import secrets
         import subprocess
         import sys
+        from pathlib import Path
 
         if self.is_running():
             return self._url
 
+        # Server-side monkey-patch for jupyter_client; see _lab_server_config.py
+        # for the rationale. Without this, picking framewise's external kernel
+        # for a notebook and then switching that notebook to a different kernel
+        # makes framewise's kernel vanish from Lab's UI until the Lab server is
+        # restarted.
+        lab_config = Path(__file__).resolve().parent / "_lab_server_config.py"
+
         common = [
             "--ServerApp.allow_external_kernels=True",
             f"--ServerApp.external_connection_dir={self._dir}",
+            f"--config={lab_config}",
         ]
         if embedded:
             port = self._free_port()
