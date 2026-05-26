@@ -15,6 +15,8 @@ from PyQt6.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -34,6 +36,7 @@ from .namespace import (
 )
 from .notebook_panel import WEBENGINE_AVAILABLE, NotebookPanel
 from .panels import PanelManager, VideoGrid
+from .segmentation import find_segmentation_subdirs, probe_seg_subdir
 from .settings import get_last_dir, set_last_dir_from_path, settings
 from .signal_panel import SignalPanel
 from .sync import FILE_FILTER, ResourceManagerPanel, SyncController
@@ -49,6 +52,82 @@ PLAYBACK_SPEEDS = [
     ("2x", 2.0),
     ("4x", 4.0),
 ]
+
+class _SegChooserDialog(QDialog):
+    """Modal picker shown when a project root holds several SEG candidates
+    (e.g. ``SEG/`` + sweep results ``SEG_p005/``, ``SEG_p007/``). Each row
+    shows the subdir name and a cheap probe of its C shape (N neurons × T
+    frames) so the user can spot the full-length run vs short debug runs.
+
+    Pre-selects the candidate with the most frames (most often the full run);
+    if probes all fail, falls back to canonical ``SEG`` then the first."""
+
+    @classmethod
+    def choose(
+        cls, root: Path, subs: list[Path], parent: QMainWindow
+    ) -> Path | None:
+        dlg = cls(root, subs, parent)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dlg._chosen
+
+    def __init__(self, root: Path, subs: list[Path], parent: QMainWindow) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Choose segmentation result")
+        self.setModal(True)
+        self._chosen: Path | None = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                f"{root}\n\nMultiple SEG results found. Pick one to load:"
+            )
+        )
+
+        probes = [probe_seg_subdir(s) for s in subs]
+        self._list = QListWidget()
+        for sub, info in zip(subs, probes):
+            if info is not None:
+                detail = f"   (N={info['n_neurons']}, T={info['n_frames']})"
+            else:
+                detail = "   (probe failed)"
+            item = QListWidgetItem(f"{sub.name}{detail}")
+            item.setData(Qt.ItemDataRole.UserRole, str(sub))
+            self._list.addItem(item)
+        self._list.setCurrentRow(self._default_row(subs, probes))
+        # Double-click = pick + close; Enter on the list works via the OK button.
+        self._list.itemDoubleClicked.connect(lambda *_: self._accept())
+        layout.addWidget(self._list, stretch=1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(460, 280)
+
+    @staticmethod
+    def _default_row(subs: list[Path], probes: list[dict | None]) -> int:
+        best_idx, best_t = -1, -1
+        for i, info in enumerate(probes):
+            if info is not None and info["n_frames"] > best_t:
+                best_idx, best_t = i, info["n_frames"]
+        if best_idx >= 0:
+            return best_idx
+        for i, s in enumerate(subs):
+            if s.name.upper() == "SEG":
+                return i
+        return 0
+
+    def _accept(self) -> None:
+        item = self._list.currentItem()
+        if item is None:
+            return
+        self._chosen = Path(item.data(Qt.ItemDataRole.UserRole))
+        self.accept()
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -298,9 +377,23 @@ class MainWindow(QMainWindow):
             "Open folder (segmentation result or TDT block)",
             get_last_dir(),
         )
-        if path:
-            set_last_dir_from_path(path)
-            self.add_video(path)
+        if not path:
+            return
+        set_last_dir_from_path(path)
+        p = Path(path)
+        # Segmentation project roots can hold several SEG_* candidates (e.g. a
+        # parameter sweep). When >1 candidate exists and the root itself isn't
+        # already a SEG dir, let the user pick — auto-defaulting to "SEG/" has
+        # silently loaded the wrong (often shorter) trace set.
+        if p.is_dir() and not (p / "infer_results.mat").exists():
+            subs = find_segmentation_subdirs(p)
+            if len(subs) > 1:
+                chosen = _SegChooserDialog.choose(p, subs, self)
+                if chosen is None:
+                    return
+                self.panel_manager.add_segmentation(chosen)
+                return
+        self.add_video(p)
 
     def _save_labels(self) -> None:
         """Write cell-type labels for every open segmentation to its

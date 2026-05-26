@@ -88,10 +88,11 @@ class SegmentationLoadError(Exception):
 
 
 def is_segmentation_dir(path: Path) -> bool:
-    """True if `path` is a segmentation result root (has SEG/infer_results.mat).
+    """True if `path` is a segmentation result root (has any SEG-style subdir
+    with ``infer_results.mat``) or a SEG subdir itself.
 
-    Accepts either the project root (containing a ``SEG`` subfolder) or the
-    ``SEG`` folder itself.
+    Accepts either the project root (containing one or more ``SEG``/``SEG_*``
+    subfolders) or a SEG subfolder directly.
     """
     if not path.is_dir():
         return False
@@ -99,13 +100,72 @@ def is_segmentation_dir(path: Path) -> bool:
     return seg is not None and (seg / "infer_results.mat").exists()
 
 
+def find_segmentation_subdirs(root: Path) -> list[Path]:
+    """Direct subdirectories of `root` that look like a SEG result
+    (contain ``infer_results.mat``). Sorted by name."""
+    if not root.is_dir():
+        return []
+    out: list[Path] = []
+    for child in sorted(root.iterdir()):
+        if child.is_dir() and (child / "infer_results.mat").exists():
+            out.append(child)
+    return out
+
+
+def probe_seg_subdir(seg_dir: Path) -> dict | None:
+    """Cheap metadata probe for the chooser dialog: read the C variable's
+    shape from ``infer_results.mat`` without loading the array. Returns
+    ``{"n_neurons", "n_frames"}`` or None if the probe fails."""
+    try:
+        import scipy.io as sio
+
+        for name, shape, _dtype in sio.whosmat(str(seg_dir / "infer_results.mat")):
+            if name == "C" and len(shape) == 2:
+                return {"n_neurons": int(shape[0]), "n_frames": int(shape[1])}
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
+
+
 def _seg_dir(path: Path) -> Path | None:
-    """Resolve the SEG folder from either the project root or SEG itself."""
+    """Resolve the SEG folder from either the project root or a SEG subdir.
+
+    Returns the directory containing ``infer_results.mat``. When `path` is a
+    project root with multiple SEG candidates (e.g. ``SEG/``, ``SEG_p007/``),
+    prefers the canonical ``SEG`` if present, else falls back to the first
+    candidate by name — callers that want the user to pick should enumerate
+    explicitly via `find_segmentation_subdirs`.
+    """
     if (path / "infer_results.mat").exists():
         return path
-    if (path / "SEG" / "infer_results.mat").exists():
-        return path / "SEG"
-    return None
+    subs = find_segmentation_subdirs(path)
+    if not subs:
+        return None
+    for s in subs:
+        if s.name.upper() == "SEG":
+            return s
+    return subs[0]
+
+
+def _resolve_project_root(seg: Path) -> Path:
+    """Pick the project root that owns sibling resources (``rmbg/``,
+    ``SEG_demix_validation/``, other SEG_* results).
+
+    `seg` is the directory containing ``infer_results.mat``. If its parent
+    hosts a sibling ``rmbg/``, other SEG candidates, or `seg` itself is the
+    canonical ``SEG`` subdir, treat the parent as the project root. Otherwise
+    `seg` is standalone, so use it directly."""
+    parent = seg.parent
+    if parent == seg:
+        return seg
+    if (parent / "rmbg").is_dir():
+        return parent
+    siblings = find_segmentation_subdirs(parent)
+    if len(siblings) > 1 and seg in siblings:
+        return parent
+    if seg.name.upper() == "SEG":
+        return parent
+    return seg
 
 
 @dataclass
@@ -431,8 +491,8 @@ def load_segmentation(path: str | Path, fps: float | None = None) -> Segmentatio
         raise SegmentationLoadError(
             f"Not a segmentation folder (no SEG/infer_results.mat): {root}"
         )
-    # Name from the project root (parent of SEG), not the SEG folder itself.
-    project_root = seg.parent if seg.name.upper() == "SEG" else seg
+    # Name from the project root (owns sibling rmbg/ etc.), not the SEG folder.
+    project_root = _resolve_project_root(seg)
     name = project_root.name or seg.name
 
     # --- traces: C (N, T) float32 ---
