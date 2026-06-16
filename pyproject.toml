@@ -29,6 +29,7 @@ analysis = [
     "scikit-learn>=1.3",
     "statsmodels>=0.14",
     "opencv-python>=4.8",
+    "meegkit>=0.1.7",
 ]
 
 [project.scripts]
