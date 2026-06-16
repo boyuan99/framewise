@@ -177,6 +177,14 @@ class PanelManager:
         """
         return self._register(panel, name, Path(""), "signal")
 
+    def register_spectrogram_panel(self, panel, name: str) -> PanelEntry:
+        """Register a pre-built SpectrogramPanel (e.g. CWT heatmap from a notebook).
+
+        Same wiring as register_signal_panel; panel type-checked via duck typing
+        (must expose `bind_master_clock` and `name`) to avoid an import cycle.
+        """
+        return self._register(panel, name, Path(""), "spectrogram")
+
     def _register(
         self,
         panel: AnyPanel,
