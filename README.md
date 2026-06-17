@@ -1,8 +1,17 @@
-# Framewise (Python / napari)
+# Framewise
 
-钙成像多视频同步查看器，基于 napari 实现。
+A multi-panel synchronized viewer for calcium imaging, behavior video, and TDT electrophysiology. All panels subscribe to a single master clock for frame-locked playback and scrubbing, with an embedded Jupyter console / Lab that can access the live objects.
 
-## 安装
+## Tech stack
+
+- **PyQt6 + pyqtgraph** — GUI and plotting
+- **h5py + dask** — lazy HDF5; **tifffile** — TIFF stacks; **imageio[ffmpeg]** — compressed video
+- **tdt** — TDT blocks; **scipy** — .mat / signal processing
+- **qtconsole + ipykernel + jupyterlab + PyQt6-WebEngine** — embedded console and Jupyter Lab
+
+## Installation
+
+Requires Python ≥ 3.10.
 
 ```bash
 conda create -n framewise python=3.11
@@ -10,16 +19,19 @@ conda activate framewise
 pip install -e .
 ```
 
-## 使用
+Optional analysis extras (scikit-learn / statsmodels / opencv / meegkit):
 
 ```bash
-python -m framewise_py video1.h5 video2.h5 video3.mp4
+pip install -e ".[analysis]"
 ```
 
-每个文件会在独立的 napari 窗口中打开。第一个窗口附带「同步组」控制面板，可手动选择哪些视频组成同步组（同步组内拖拽时间滑块时联动）。
+## Usage
 
-## 支持格式
+```bash
+framewise [files or folders ...]   # entry-point script
+python -m framewise_py [...]        # or run as a module
+```
 
-- HDF5 (`.h5`, `.hdf5`) — 假设数据集形状为 `(T, H, W)` 或 `(T, C, H, W)`
-- TIFF 堆栈 (`.tif`, `.tiff`)
-- 视频文件 (`.mp4`, `.avi`) — 建议使用全关键帧编码以获得流畅 seek
+Arguments are optional — once the window is open, load data via **File → Open…** (video/stacks) or **File → Open Folder…** (TDT block / segmentation result folder).
+
+Supported sources: HDF5 `.h5/.hdf5`, TIFF `.tif/.tiff`, video `.mp4/.avi/.mov/.mkv`, TDT block folders, and CNMF/CaImAn segmentation result folders (`SEG/` + optional `rmbg/`).
