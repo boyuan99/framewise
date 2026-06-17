@@ -117,6 +117,7 @@ class _Overlay:
     slider: QSlider | None = None
     frame_label: QLabel | None = None
     hist_dialog: QDialog | None = None  # lazy: created on first Hist click
+    hist_widget: Any = None  # the HistogramLUTWidget inside hist_dialog
     visible_cb: QCheckBox | None = None  # so Flip can drive the UI in sync
 
 
@@ -799,8 +800,12 @@ class VideoPanel(QWidget):
         if img is None or _is_rgb(img):
             ov.image_item.setLookupTable(None)
             return
-        lut = _make_colormap(ov.cmap_name).getLookupTable(0.0, 1.0, 256)
-        ov.image_item.setLookupTable(lut)
+        cmap = _make_colormap(ov.cmap_name)
+        ov.image_item.setLookupTable(cmap.getLookupTable(0.0, 1.0, 256))
+        # If this overlay's histogram dialog is open, keep its gradient in sync
+        # so a later level drag doesn't re-push the old (gray) LUT onto the image.
+        if ov.hist_widget is not None:
+            ov.hist_widget.gradient.setColorMap(cmap)
 
     def _build_overlay_widget(self, ov: _Overlay) -> QWidget:
         """Build the overlay control widget. Static overlays get a single
@@ -955,12 +960,20 @@ class VideoPanel(QWidget):
             layout.setContentsMargins(4, 4, 4, 4)
             hist = pg.HistogramLUTWidget()
             hist.setImageItem(ov.image_item)
+            # setImageItem binds the histogram's (default gray) gradient to the
+            # image item, clobbering the tint LUT we applied earlier. Seed the
+            # gradient with this overlay's colormap so binding keeps its tint.
+            # (RGB(A) overlays ignore LUTs, so skip them.)
+            img = self._overlay_current_image(ov)
+            if img is not None and not _is_rgb(img):
+                hist.gradient.setColorMap(_make_colormap(ov.cmap_name))
             hist.item.sigLevelsChanged.connect(
                 lambda *_, h=hist, o=ov: self._on_overlay_hist_levels_changed(h, o)
             )
             layout.addWidget(hist)
             dialog.resize(240, 420)
             ov.hist_dialog = dialog
+            ov.hist_widget = hist
         if ov.hist_dialog.isVisible():
             ov.hist_dialog.hide()
         else:
