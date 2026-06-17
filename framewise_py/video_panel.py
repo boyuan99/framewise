@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -256,18 +257,30 @@ class VideoPanel(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
 
+        # The image + scrub slider + control row live in a top container; the
+        # overlays section sits below them. A vertical splitter between the two
+        # lets the user drag the overlay area taller so many overlay rows are
+        # visible at once instead of cramped into a fixed 220px scroll strip.
+        top = QWidget()
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(2)
+        # Kept so subclasses can splice their own control rows in via
+        # _insert_top_control() instead of guessing a layout index.
+        self._top_layout = top_layout
+
         self.image_view = pg.ImageView()
         self.image_view.ui.histogram.hide()
         self.image_view.ui.menuBtn.hide()
         self.image_view.ui.roiBtn.hide()
-        layout.addWidget(self.image_view, stretch=1)
+        top_layout.addWidget(self.image_view, stretch=1)
         # Intercept scene mouse events so "✏ ROI" mode can drag out new ellipses.
         self.image_view.getView().scene().installEventFilter(self)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, self._n_frames - 1)
         self.slider.valueChanged.connect(self._on_slider_changed)
-        layout.addWidget(self.slider)
+        top_layout.addWidget(self.slider)
 
         controls = QHBoxLayout()
 
@@ -364,12 +377,14 @@ class VideoPanel(QWidget):
         )
         controls_scroll.setMinimumWidth(0)
         controls_scroll.setFixedHeight(controls_widget.sizeHint().height() + 16)
-        layout.addWidget(controls_scroll)
+        # Kept so _insert_top_control() can place subclass rows just above it.
+        self._controls_scroll = controls_scroll
+        top_layout.addWidget(controls_scroll)
 
         # Overlays section — hidden until first overlay is added. Wrapped in a
         # scrollable strip (same reason as the controls row) so wide overlay
-        # rows don't pin the panel's minimum width; tall stacks scroll instead
-        # of stealing the image's vertical space.
+        # rows don't pin the panel's minimum width; tall stacks scroll when the
+        # user hasn't dragged the splitter tall enough to show them all.
         self._overlays_frame = QFrame()
         self._overlays_frame.setFrameShape(QFrame.Shape.StyledPanel)
         self._overlays_layout = QVBoxLayout(self._overlays_frame)
@@ -388,15 +403,35 @@ class VideoPanel(QWidget):
         )
         self._overlays_scroll.setMinimumWidth(0)
         self._overlays_scroll.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        self._overlays_scroll.setMaximumHeight(220)
         self._overlays_scroll.setVisible(False)
-        layout.addWidget(self._overlays_scroll)
+
+        # Vertical splitter: image/controls on top, overlays below. Dragging the
+        # handle resizes the overlay area independently. The top pane can't be
+        # collapsed to nothing (the video must stay visible); the overlay pane
+        # can, so it folds away when not needed.
+        self._splitter = QSplitter(Qt.Orientation.Vertical)
+        self._splitter.setChildrenCollapsible(False)
+        self._splitter.addWidget(top)
+        self._splitter.addWidget(self._overlays_scroll)
+        self._splitter.setStretchFactor(0, 1)
+        self._splitter.setStretchFactor(1, 0)
+        layout.addWidget(self._splitter, stretch=1)
 
         # Apply default colormap (gray) so explicit changes via the combo box
         # always go through the same code path.
         self._on_cmap_changed("Gray")
+
+    def _insert_top_control(self, widget: QWidget) -> None:
+        """Splice a subclass-provided control row into the top pane, directly
+        below the scrub slider and above the inherited control row. Subclasses
+        should use this rather than indexing into the layout, which is brittle
+        (the top pane lives inside a splitter, not the panel's root layout)."""
+        idx = self._top_layout.indexOf(self._controls_scroll)
+        if idx < 0:
+            idx = self._top_layout.count()
+        self._top_layout.insertWidget(idx, widget)
 
     def _on_slider_changed(self, value: int) -> None:
         if value == self._current_frame:
@@ -721,7 +756,15 @@ class VideoPanel(QWidget):
         ov.row = widget
         self._overlays.append(ov)
         self._overlays_layout.addWidget(widget)
+        first_overlay = not self._overlays_scroll.isVisible()
         self._overlays_scroll.setVisible(True)
+        # On the first overlay, give the overlay pane a sensible starting height
+        # (the user can drag the splitter to taste afterwards). Without this the
+        # Expanding overlay pane would claim too much of the video's space.
+        if first_overlay:
+            total = max(self._splitter.height(), 1)
+            overlay_h = min(200, total // 3)
+            self._splitter.setSizes([total - overlay_h, overlay_h])
 
         # Initial render + LUT.
         self._apply_overlay_colormap(ov)

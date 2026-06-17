@@ -319,8 +319,8 @@ class SegmentationPanel(VideoPanel):
         scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         scroll.setMinimumWidth(0)
         scroll.setFixedHeight(holder.sizeHint().height() + 12)
-        # Insert directly below the image (above the inherited control scroll).
-        self.layout().insertWidget(2, scroll)
+        # Insert directly below the slider (above the inherited control scroll).
+        self._insert_top_control(scroll)
         self._update_layer_visibility()
 
     def _selected_text(self) -> str:
