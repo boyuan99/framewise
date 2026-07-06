@@ -7,7 +7,14 @@ import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
+from PyQt6.QtGui import (
+    QAction,
+    QActionGroup,
+    QDragEnterEvent,
+    QDropEvent,
+    QGuiApplication,
+    QKeySequence,
+)
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -369,6 +376,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Framewise")
         self.resize(1400, 900)
         self.setDockNestingEnabled(True)
+        # Drop files/folders anywhere on the window to load them (same paths as
+        # File → Open / Open Folder).
+        self.setAcceptDrops(True)
 
         self.master_clock = MasterClock(self)
 
@@ -623,7 +633,13 @@ class MainWindow(QMainWindow):
         if not path:
             return
         set_last_dir_from_path(path)
-        p = Path(path)
+        self._load_folder(Path(path))
+
+    def _load_folder(self, p: Path) -> None:
+        """Load a folder as a segmentation result (or TDT block / video fallback).
+
+        Shared by File → Open Folder and drag-and-drop.
+        """
         # Resolve the SEG folder first. A project root can hold several SEG_*
         # candidates (e.g. a parameter sweep); when the root itself isn't a SEG
         # dir and >1 candidate exists, let the user pick — auto-defaulting to
@@ -648,6 +664,26 @@ class MainWindow(QMainWindow):
             self.panel_manager.add_segmentation(seg_dir, label_spec=spec)
             return
         self.add_video(p)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        last: str | None = None
+        for url in event.mimeData().urls():
+            local = url.toLocalFile()
+            if not local:
+                continue
+            last = local
+            p = Path(local)
+            if p.is_dir():
+                self._load_folder(p)
+            else:
+                self.add_video(p)
+        if last:
+            set_last_dir_from_path(last)
+        event.acceptProposedAction()
 
     def _reapply_labels(self) -> None:
         """Re-derive a loaded segmentation's labels from a classifier CSV with
