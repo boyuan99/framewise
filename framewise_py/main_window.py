@@ -9,11 +9,18 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
 from PyQt6.QtWidgets import (
+    QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDockWidget,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -21,6 +28,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QStackedWidget,
     QTabBar,
     QToolBar,
@@ -36,7 +44,15 @@ from .namespace import (
 )
 from .notebook_panel import WEBENGINE_AVAILABLE, NotebookPanel
 from .panels import PanelManager, VideoGrid
-from .segmentation import find_segmentation_subdirs, probe_seg_subdir
+from .segmentation import (
+    LabelSpec,
+    count_labels,
+    discover_label_sources,
+    find_segmentation_subdirs,
+    labels_from_csv,
+    probe_seg_subdir,
+    read_label_csv,
+)
 from .settings import get_last_dir, set_last_dir_from_path, settings
 from .signal_panel import SignalPanel
 from .sync import FILE_FILTER, ResourceManagerPanel, SyncController
@@ -127,6 +143,224 @@ class _SegChooserDialog(QDialog):
             return
         self._chosen = Path(item.data(Qt.ItemDataRole.UserRole))
         self.accept()
+
+
+# Order cell-type labels appear in the label dialog's live tally.
+_LABEL_TALLY_ORDER = ("D1", "D2", "CHI", "PV", "bad", "unknown")
+
+
+class _LabelSourceDialog(QDialog):
+    """Pick which cell-type annotation to load for a segmentation and tune the
+    confidence thresholds that gate the CSV classifier labels.
+
+    The deepwonder classifiers funnel most cells into a catch-all bucket
+    ("tdt-" in the 3-class file, "PV-" in the PV file); those clear no positive
+    threshold and land in the *fallback* (default "unknown") rather than a
+    confident negative. Edge/duplicate flags map to "bad" (hidden). A live tally
+    updates as the source/thresholds change so the user can see how many neurons
+    each label would get before committing. Returns a `LabelSpec` (or None on
+    cancel)."""
+
+    @classmethod
+    def choose(
+        cls, seg_dir: Path, parent: QMainWindow, initial: "LabelSpec | None" = None
+    ) -> "LabelSpec | None":
+        dlg = cls(seg_dir, parent, initial)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dlg.spec()
+
+    def __init__(
+        self, seg_dir: Path, parent: QMainWindow, initial: "LabelSpec | None" = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Choose labels to load")
+        self.setModal(True)
+        self._seg_dir = seg_dir
+        self._sources = discover_label_sources(seg_dir)
+        probe = probe_seg_subdir(seg_dir)
+        self._n = probe["n_neurons"] if probe else None
+        self._rows_cache: dict[str, list] = {}  # source key -> parsed CSV rows
+
+        layout = QVBoxLayout(self)
+        n_txt = f"{self._n} neurons" if self._n is not None else "neuron count unknown"
+        layout.addWidget(
+            QLabel(f"{seg_dir.name}  ({n_txt})\n\nLoad cell-type labels from:")
+        )
+
+        # --- source radios (only sources whose file exists, + "none") ---
+        self._group = QButtonGroup(self)
+        src_box = QGroupBox()
+        src_layout = QVBoxLayout(src_box)
+        for i, s in enumerate(self._sources):
+            rb = QRadioButton(s["title"])
+            rb.setProperty("source_key", s["key"])
+            self._group.addButton(rb, i)
+            src_layout.addWidget(rb)
+        self._group.button(0).setChecked(True)
+        self._group.buttonToggled.connect(lambda *_: self._recompute())
+        layout.addWidget(src_box)
+
+        # --- quality filters (shared; enabled per source) ---
+        self._cb_edge = QCheckBox("Exclude edge cells (is_edge) -> bad")
+        self._cb_edge.setChecked(True)
+        self._cb_dup = QCheckBox("Exclude duplicates (is_dup) -> bad")
+        self._cb_dup.setChecked(True)
+        qbox = QGroupBox("Quality filters")
+        qlayout = QVBoxLayout(qbox)
+        qlayout.addWidget(self._cb_edge)
+        qlayout.addWidget(self._cb_dup)
+        layout.addWidget(qbox)
+
+        # --- per-source confidence thresholds (README-calibrated defaults) ---
+        self._sp_tz_d1 = self._spin(-20, 20, 0.01, 1.29)
+        self._sp_bz = self._spin(-20, 100, 0.1, 5.0)
+        self._sp_pneg = self._spin(0, 1, 0.01, 0.9)
+        self._g3 = QGroupBox("3-class thresholds")
+        f3 = QFormLayout(self._g3)
+        f3.addRow("tz >= (-> D1)", self._sp_tz_d1)
+        f3.addRow("bz >= (-> CHI)", self._sp_bz)
+        f3.addRow("p_neg >= (-> D2)", self._sp_pneg)
+        layout.addWidget(self._g3)
+
+        self._sp_ptdt = self._spin(0, 1, 0.01, 0.5)
+        self._gtdt = QGroupBox("tdt threshold")
+        ftdt = QFormLayout(self._gtdt)
+        ftdt.addRow("p_tdt_pos >= (-> D1)", self._sp_ptdt)
+        layout.addWidget(self._gtdt)
+
+        self._sp_tzpv = self._spin(-20, 60, 0.01, 2.9)
+        self._cb_pvman = QCheckBox("Honor manual override column")
+        self._cb_pvman.setChecked(True)
+        self._gpv = QGroupBox("PV thresholds")
+        fpv = QFormLayout(self._gpv)
+        fpv.addRow("tz >= (-> PV)", self._sp_tzpv)
+        fpv.addRow(self._cb_pvman)
+        layout.addWidget(self._gpv)
+
+        # --- fallback bucket for cells clearing no positive threshold ---
+        self._fallback = QComboBox()
+        self._fallback.addItem("unknown (recommended)", "unknown")
+        self._fallback.addItem("D2 / keep CSV negative", "D2")
+        self._fallback.addItem("bad (hide)", "bad")
+        self._fb_row = QGroupBox("Cells below all thresholds")
+        fbl = QHBoxLayout(self._fb_row)
+        fbl.addWidget(QLabel("Fallback ->"))
+        fbl.addWidget(self._fallback, stretch=1)
+        layout.addWidget(self._fb_row)
+
+        # live-update wiring
+        for w in (
+            self._sp_tz_d1,
+            self._sp_bz,
+            self._sp_pneg,
+            self._sp_ptdt,
+            self._sp_tzpv,
+        ):
+            w.valueChanged.connect(lambda *_: self._recompute())
+        for w in (self._cb_edge, self._cb_dup, self._cb_pvman):
+            w.toggled.connect(lambda *_: self._recompute())
+        self._fallback.currentIndexChanged.connect(lambda *_: self._recompute())
+
+        self._preview = QLabel()
+        self._preview.setWordWrap(True)
+        layout.addWidget(self._preview)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(470, 580)
+        if initial is not None:
+            self._apply_initial(initial)
+        self._recompute()
+
+    def _apply_initial(self, spec: LabelSpec) -> None:
+        """Pre-fill the controls from a prior `LabelSpec` (for re-apply): select
+        its source radio if still available, and restore every threshold."""
+        for i, s in enumerate(self._sources):
+            if s["key"] == spec.source:
+                self._group.button(i).setChecked(True)
+                break
+        self._sp_tz_d1.setValue(spec.tz_d1)
+        self._sp_bz.setValue(spec.bz_chi)
+        self._sp_pneg.setValue(spec.p_neg_d2)
+        self._sp_ptdt.setValue(spec.p_tdt_pos)
+        self._sp_tzpv.setValue(spec.tz_pv)
+        self._cb_edge.setChecked(spec.exclude_edge)
+        self._cb_dup.setChecked(spec.exclude_dup)
+        self._cb_pvman.setChecked(spec.pv_use_manual)
+        idx = self._fallback.findData(spec.fallback)
+        if idx >= 0:
+            self._fallback.setCurrentIndex(idx)
+
+    @staticmethod
+    def _spin(lo: float, hi: float, step: float, val: float) -> QDoubleSpinBox:
+        sp = QDoubleSpinBox()
+        sp.setRange(lo, hi)
+        sp.setSingleStep(step)
+        sp.setDecimals(2)
+        sp.setValue(val)
+        return sp
+
+    def _current_key(self) -> str:
+        return self._group.checkedButton().property("source_key")
+
+    def spec(self) -> LabelSpec:
+        return LabelSpec(
+            source=self._current_key(),
+            tz_d1=self._sp_tz_d1.value(),
+            bz_chi=self._sp_bz.value(),
+            p_neg_d2=self._sp_pneg.value(),
+            p_tdt_pos=self._sp_ptdt.value(),
+            tz_pv=self._sp_tzpv.value(),
+            exclude_edge=self._cb_edge.isChecked(),
+            exclude_dup=self._cb_dup.isChecked(),
+            pv_use_manual=self._cb_pvman.isChecked(),
+            fallback=self._fallback.currentData(),
+        )
+
+    def _rows_for(self, key: str) -> list:
+        if key not in self._rows_cache:
+            path = next(
+                (s["path"] for s in self._sources if s["key"] == key), None
+            )
+            self._rows_cache[key] = read_label_csv(path) if path else []
+        return self._rows_cache[key]
+
+    def _recompute(self) -> None:
+        """Show/hide the relevant threshold group for the chosen source and
+        refresh the live label tally."""
+        key = self._current_key()
+        is_csv = key in ("3class", "tdt", "pv")
+        self._g3.setVisible(key == "3class")
+        self._gtdt.setVisible(key == "tdt")
+        self._gpv.setVisible(key == "pv")
+        self._fb_row.setVisible(is_csv)
+        # is_edge is used by 3class + pv; is_dup only by 3class.
+        self._cb_edge.setEnabled(key in ("3class", "pv"))
+        self._cb_dup.setEnabled(key == "3class")
+        if not is_csv or self._n is None:
+            if key == "manual":
+                src = next((s for s in self._sources if s["key"] == "manual"), None)
+                exists = bool(src and src["path"] and src["path"].exists())
+                note = (
+                    "Loads the saved cell_labels.json as-is."
+                    if exists
+                    else "No cell_labels.json yet -> all neurons start as 'unknown'."
+                )
+            elif key == "none":
+                note = "All neurons start as 'unknown'."
+            else:
+                note = "Preview needs the neuron count (probe failed)."
+            self._preview.setText(note)
+            return
+        labels = labels_from_csv(self._rows_for(key), self._n, self.spec())
+        counts = count_labels(labels)
+        parts = [f"{lab} {counts[lab]}" for lab in _LABEL_TALLY_ORDER if counts.get(lab)]
+        self._preview.setText(f"Preview (n={self._n}):   " + "    ".join(parts))
 
 
 class MainWindow(QMainWindow):
@@ -248,6 +482,15 @@ class MainWindow(QMainWindow):
         )
         act_save.triggered.connect(self._save_labels)
         file_menu.addAction(act_save)
+
+        act_relabel = QAction("Re-apply &Labels…", self)
+        act_relabel.setShortcut("Ctrl+L")
+        act_relabel.setToolTip(
+            "Re-derive an open segmentation's labels from a classifier CSV with "
+            "new thresholds (no reload; undoable)"
+        )
+        act_relabel.triggered.connect(self._reapply_labels)
+        file_menu.addAction(act_relabel)
 
         file_menu.addSeparator()
 
@@ -381,19 +624,63 @@ class MainWindow(QMainWindow):
             return
         set_last_dir_from_path(path)
         p = Path(path)
-        # Segmentation project roots can hold several SEG_* candidates (e.g. a
-        # parameter sweep). When >1 candidate exists and the root itself isn't
-        # already a SEG dir, let the user pick — auto-defaulting to "SEG/" has
-        # silently loaded the wrong (often shorter) trace set.
-        if p.is_dir() and not (p / "infer_results.mat").exists():
+        # Resolve the SEG folder first. A project root can hold several SEG_*
+        # candidates (e.g. a parameter sweep); when the root itself isn't a SEG
+        # dir and >1 candidate exists, let the user pick — auto-defaulting to
+        # "SEG/" has silently loaded the wrong (often shorter) trace set.
+        seg_dir: Path | None = None
+        if (p / "infer_results.mat").exists():
+            seg_dir = p
+        elif p.is_dir():
             subs = find_segmentation_subdirs(p)
-            if len(subs) > 1:
-                chosen = _SegChooserDialog.choose(p, subs, self)
-                if chosen is None:
+            if len(subs) == 1:
+                seg_dir = subs[0]
+            elif len(subs) > 1:
+                seg_dir = _SegChooserDialog.choose(p, subs, self)
+                if seg_dir is None:
                     return
-                self.panel_manager.add_segmentation(chosen)
+        # For a segmentation, ask which cell-type labels to load (manual JSON vs
+        # a CSV classifier, with threshold filtering) before loading.
+        if seg_dir is not None:
+            spec = _LabelSourceDialog.choose(seg_dir, self)
+            if spec is None:
                 return
+            self.panel_manager.add_segmentation(seg_dir, label_spec=spec)
+            return
         self.add_video(p)
+
+    def _reapply_labels(self) -> None:
+        """Re-derive a loaded segmentation's labels from a classifier CSV with
+        new thresholds — reopens the label dialog (pre-filled with the current
+        source + thresholds) and re-applies in place, no SEG reload. The change
+        is undoable (Ctrl+Z in the panel) and unsaved until File → Save."""
+        segs = [e for e in self.panel_manager.entries if e.kind == "segmentation"]
+        if not segs:
+            QMessageBox.information(
+                self, "Re-apply Labels", "No segmentation is open."
+            )
+            return
+        if len(segs) == 1:
+            entry = segs[0]
+        else:
+            names = [e.panel.seg.name for e in segs]
+            name, ok = QInputDialog.getItem(
+                self, "Re-apply Labels", "Segmentation:", names, 0, False
+            )
+            if not ok:
+                return
+            entry = segs[names.index(name)]
+        seg = entry.panel.seg
+        seg_dir = seg.label_path.parent if seg.label_path is not None else seg.root
+        spec = _LabelSourceDialog.choose(seg_dir, self, entry.panel.last_label_spec)
+        if spec is None:
+            return
+        changed = entry.panel.reapply_label_spec(spec)
+        self.statusBar().showMessage(
+            f"Re-applied labels to {seg.name}: {changed} neuron(s) changed "
+            "(Ctrl+Z to undo; File → Save to persist).",
+            6000,
+        )
 
     def _save_labels(self) -> None:
         """Write cell-type labels for every open segmentation to its
