@@ -79,8 +79,14 @@ class SegmentationPanel(VideoPanel):
         self,
         seg: SegmentationResult,
         parent: QWidget | None = None,
+        label_spec: Any = None,
     ) -> None:
         self._seg = seg
+        # The LabelSpec this segmentation's labels were last derived from (load
+        # time or last re-apply). Remembered so "Re-apply Labels" can reopen the
+        # dialog pre-filled with the current source + thresholds. None == the
+        # default manual/JSON load.
+        self._label_spec = label_spec
         # Selection is organized into groups shown in the Resource Manager.
         # Group 0 is the default "Clicked" group (single clicks / ID picks);
         # each drag-box adds a new "Box N" group. A neuron lives in one group.
@@ -403,6 +409,32 @@ class SegmentationPanel(VideoPanel):
         so labeling a large box-selection is O(N), not O(N²) repaints. Recorded
         on the undo stack."""
         self._apply_label_map({int(n): label for n in neurons}, record=True)
+
+    @property
+    def last_label_spec(self) -> Any:
+        """The LabelSpec this panel's labels were last derived from (None for the
+        default manual/JSON load). Lets the re-apply dialog reopen pre-filled."""
+        return self._label_spec
+
+    def reapply_label_spec(self, spec: Any) -> int:
+        """Recompute every neuron's label from `spec` (a CSV classifier + new
+        thresholds, or manual/none) and apply it as one undoable batch — no SEG
+        reload, only the (cheap) classifier CSV is re-read. Returns how many
+        neuron labels changed."""
+        from .segmentation import resolve_labels
+
+        seg_dir = (
+            self._seg.label_path.parent
+            if self._seg.label_path is not None
+            else self._seg.root
+        )
+        new_labels, _dirty = resolve_labels(seg_dir, self._seg.n_neurons, spec)
+        old = list(self._seg.labels)
+        self._apply_label_map(
+            {n: new_labels[n] for n in range(len(new_labels))}, record=True
+        )
+        self._label_spec = spec
+        return sum(1 for n in range(len(new_labels)) if new_labels[n] != old[n])
 
     def _apply_label_map(self, mapping: dict, record: bool) -> None:
         """Apply a {neuron: label} map in one batch, repainting once. Any neuron

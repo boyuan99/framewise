@@ -164,10 +164,10 @@ class PanelManager:
         panel = SignalPanel(name=name, traces=traces)
         return self._register(panel, name, path, "signal")
 
-    def add_segmentation(self, path: str | Path) -> PanelEntry:
+    def add_segmentation(self, path: str | Path, label_spec=None) -> PanelEntry:
         path = Path(path)
-        seg = load_segmentation(path)
-        panel = SegmentationPanel(seg)
+        seg = load_segmentation(path, label_spec=label_spec)
+        panel = SegmentationPanel(seg, label_spec=label_spec)
         return self._register(panel, seg.name, path, "segmentation")
 
     def register_signal_panel(self, panel: SignalPanel, name: str) -> PanelEntry:

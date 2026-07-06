@@ -82,6 +82,15 @@ DEFAULT_LABEL = "unknown"
 _BAD_LEGACY_NAME = "bad_rois.json"
 _LABELS_NAME = "cell_labels.json"
 
+# Upstream (deepwonder) classifier outputs that live beside the segmentation.
+# Each CSV's `cell_id` column is the footprints_A column index == neuron index,
+# so rows map straight onto `labels`. See `LabelSpec` / `labels_from_csv` for the
+# threshold rules; the per-file column meanings are documented in the sibling
+# *_README.txt files. These are read-only inputs — Framewise never writes them.
+_CSV_3CLASS = "classification_3class.csv"
+_CSV_TDT = "tdt_classification.csv"
+_CSV_PV = "classification_PV_2class.csv"
+
 
 class SegmentationLoadError(Exception):
     pass
@@ -480,8 +489,19 @@ class SegmentationResult:
         )
 
 
-def load_segmentation(path: str | Path, fps: float | None = None) -> SegmentationResult:
-    """Load a segmentation result folder into a `SegmentationResult`."""
+def load_segmentation(
+    path: str | Path,
+    fps: float | None = None,
+    label_spec: "LabelSpec | None" = None,
+) -> SegmentationResult:
+    """Load a segmentation result folder into a `SegmentationResult`.
+
+    `label_spec` selects where per-neuron cell-type labels come from. When None
+    (or its source is "manual") labels load from SEG/cell_labels.json as before;
+    a CSV source (see `discover_label_sources`) derives labels from a deepwonder
+    classifier via `labels_from_csv`. CSV-derived labels are marked dirty (they
+    are not yet in cell_labels.json) so File -> Save persists the chosen mapping;
+    `label_path` always stays SEG/cell_labels.json regardless of source."""
     import scipy.io as sio
     import scipy.sparse as sp
 
@@ -517,10 +537,9 @@ def load_segmentation(path: str | Path, fps: float | None = None) -> Segmentatio
     # --- optional rmbg movie (lazy concatenated blocks) ---
     video = _load_rmbg_movie(project_root)
 
-    # --- cell-type labels (persisted beside the segmentation; legacy bad list
-    # migrated on first load) ---
+    # --- cell-type labels: manual JSON (default) or a CSV classifier source ---
     label_path = seg / _LABELS_NAME
-    labels = _load_labels(label_path, seg / _BAD_LEGACY_NAME, A.shape[1])
+    labels, labels_dirty = resolve_labels(seg, A.shape[1], label_spec)
 
     # --- optional demixed traces (SEG_demix_validation/) ---
     C_demix, demixed = _load_demix(
@@ -543,9 +562,42 @@ def load_segmentation(path: str | Path, fps: float | None = None) -> Segmentatio
         colors=colors,
         labels=labels,
         label_path=label_path,
+        labels_dirty=labels_dirty,
         C_demix=C_demix,
         demixed=demixed,
     )
+
+
+def resolve_labels(
+    seg: Path, n_neurons: int, spec: "LabelSpec | None"
+) -> tuple[list, bool]:
+    """Compute a label list from a `LabelSpec` → (labels, labels_dirty).
+
+    Used both at load (`load_segmentation`) and for in-place re-thresholding
+    (`SegmentationPanel.reapply_label_spec`), so a loaded segmentation can change
+    source/thresholds without re-reading SEG.tiff.
+
+    None / "manual" -> cell_labels.json (or legacy migration), clean.
+    "none"          -> all default, clean.
+    a CSV source    -> derived via `labels_from_csv`, marked dirty so the derived
+                       mapping can be persisted to cell_labels.json on Save."""
+    if spec is None or spec.source in ("manual", None):
+        labels = _load_labels(seg / _LABELS_NAME, seg / _BAD_LEGACY_NAME, n_neurons)
+        return labels, False
+    if spec.source == "none":
+        return [DEFAULT_LABEL] * n_neurons, False
+    csv_path = next(
+        (s["path"] for s in discover_label_sources(seg) if s["key"] == spec.source),
+        None,
+    )
+    if csv_path is None:
+        print(
+            f"segmentation: label source {spec.source!r} not found in {seg}; "
+            "falling back to all-unknown"
+        )
+        return [DEFAULT_LABEL] * n_neurons, False
+    labels = labels_from_csv(read_label_csv(csv_path), n_neurons, spec)
+    return labels, True
 
 
 def _load_demix(path: Path, n_neurons: int, sio) -> tuple:
@@ -597,6 +649,164 @@ def _load_labels(label_path: Path, bad_legacy: Path, n_neurons: int) -> list:
     for i in _load_bad(bad_legacy, n_neurons):
         labels[i] = "bad"
     return labels
+
+
+# ----- CSV classifier labels (deepwonder outputs; read-only) -----------------
+
+
+@dataclass
+class LabelSpec:
+    """How to derive per-neuron labels when loading a segmentation.
+
+    `source` picks the annotation file (see `discover_label_sources`); the
+    thresholds gate which neurons earn a confident cell type.
+
+    The classifiers' "tdt-"/"PV-" bucket is a catch-all that mixes genuine
+    negatives (real D2) with low-confidence/ambiguous cells. Rather than trust
+    or discard the whole bucket, each negative class gets its OWN confidence
+    gate: in 3class, ``p_neg >= p_neg_d2`` -> D2 (confident negative), and in
+    tdt, ``tier == 0`` -> D2. Cells that clear no positive AND no negative gate
+    are the ambiguous remainder and land in `fallback` (default "unknown").
+    Quality flags (edge/duplicate) map to "bad" (hidden from canvas +
+    hit-testing).
+
+    Threshold defaults are the per-session calibrated cutoffs from the sibling
+    *_README.txt files (3class: tz>1.29 -> D1, bz>5 -> CHI; PV: tz>2.9 -> PV).
+    `p_neg_d2` has no README calibration; 0.9 keeps the confidently-negative D2
+    core (~tier-0 sized, balanced against the D1 count) and drops the ambiguous
+    ~84% — tune it via the dialog's live tally.
+    """
+
+    source: str = "manual"  # manual | 3class | tdt | pv | none
+    tz_d1: float = 1.29  # 3class: tz    >= this -> D1  (tdt+)
+    bz_chi: float = 5.0  # 3class: bz    >= this -> CHI (bfp+)
+    p_neg_d2: float = 0.9  # 3class: p_neg >= this -> D2  (confident tdt-)
+    p_tdt_pos: float = 0.5  # tdt:    p_tdt_pos >= this -> D1
+    tz_pv: float = 2.9  # pv:     tz    >= this -> PV
+    exclude_edge: bool = True  # is_edge == 1 -> bad
+    exclude_dup: bool = True  # is_dup  == 1 -> bad
+    pv_use_manual: bool = True  # pv: honor the CSV "manual" override column
+    fallback: str = DEFAULT_LABEL  # where the ambiguous remainder lands
+
+
+def discover_label_sources(seg_dir: Path) -> list[dict]:
+    """Cell-type label sources present in a SEG folder, in preferred order.
+
+    Each entry is ``{"key", "title", "path"}``. "manual" is always first (it is
+    the safe default: it preserves the legacy bad_rois.json migration and yields
+    all-unknown when no cell_labels.json exists yet); CSV sources are listed only
+    when their file is present; a terminal "none" (all-unknown, no migration)
+    source is always appended."""
+    out: list[dict] = []
+    manual = seg_dir / _LABELS_NAME
+    manual_title = (
+        "Manual labels (cell_labels.json)"
+        if manual.exists()
+        else "Manual labels (none saved yet -> all unknown)"
+    )
+    out.append({"key": "manual", "title": manual_title, "path": manual})
+    for key, fname, title in (
+        ("3class", _CSV_3CLASS, "3-class classifier (D1 / CHI / D2)"),
+        ("tdt", _CSV_TDT, "tdt classifier (D1 / D2)"),
+        ("pv", _CSV_PV, "PV classifier (PV)"),
+    ):
+        p = seg_dir / fname
+        if p.exists():
+            out.append({"key": key, "title": title, "path": p})
+    out.append({"key": "none", "title": "None (all unknown)", "path": None})
+    return out
+
+
+def read_label_csv(path: Path) -> list[dict]:
+    """Parse a classifier CSV into a list of raw string-valued rows (stdlib csv,
+    no pandas). Returns [] on any read error."""
+    import csv
+
+    try:
+        with open(path, newline="") as f:
+            return list(csv.DictReader(f))
+    except (OSError, csv.Error) as exc:
+        print(f"segmentation: could not read {path} ({exc}); ignoring")
+        return []
+
+
+def _csv_float(row: dict, key: str) -> float:
+    """Row value as float, or NaN when missing/blank/non-numeric (NaN fails every
+    ``>=`` threshold, so such cells fall through to the fallback bucket)."""
+    try:
+        return float(row[key])
+    except (KeyError, ValueError, TypeError):
+        return float("nan")
+
+
+def _csv_flag(row: dict, key: str) -> bool:
+    """Row value as a 0/1 boolean flag (False when missing/non-numeric)."""
+    try:
+        return int(float(row[key])) == 1
+    except (KeyError, ValueError, TypeError):
+        return False
+
+
+def _classify_row(row: dict, spec: LabelSpec) -> str:
+    """Map one CSV row to a `CELL_LABELS` value per `spec`'s source + thresholds."""
+    if spec.source == "3class":
+        if spec.exclude_edge and _csv_flag(row, "is_edge"):
+            return "bad"
+        if spec.exclude_dup and _csv_flag(row, "is_dup"):
+            return "bad"
+        if _csv_float(row, "bz") >= spec.bz_chi:
+            return "CHI"
+        if _csv_float(row, "tz") >= spec.tz_d1:
+            return "D1"
+        if _csv_float(row, "p_neg") >= spec.p_neg_d2:
+            return "D2"  # confident negative
+        return spec.fallback  # ambiguous "tdt-" remainder
+    if spec.source == "tdt":
+        tier = _csv_float(row, "tier")
+        if tier != tier:  # NaN tier == invalid/border cell
+            return "bad"
+        if _csv_float(row, "p_tdt_pos") >= spec.p_tdt_pos:
+            return "D1"
+        if tier == 0:  # confident tdt- -> real D2 (not the fallback bucket)
+            return "D2"
+        return spec.fallback  # tier-1 ambiguous
+    if spec.source == "pv":
+        if spec.pv_use_manual:
+            manual = (row.get("manual") or "").strip()
+            if manual == "PV":
+                return "PV"
+            if manual == "bad":
+                return "bad"
+        if spec.exclude_edge and _csv_flag(row, "is_edge"):
+            return "bad"
+        if _csv_float(row, "tz") >= spec.tz_pv:
+            return "PV"
+        return spec.fallback  # "PV-" catch-all
+    return spec.fallback
+
+
+def labels_from_csv(rows: list[dict], n_neurons: int, spec: LabelSpec) -> list:
+    """Build a length-`n_neurons` label list from parsed CSV `rows` per `spec`.
+
+    Neurons without a matching (or out-of-range) `cell_id` keep the default
+    "unknown". Every produced label is a valid `CELL_LABELS` entry."""
+    labels = [DEFAULT_LABEL] * n_neurons
+    for row in rows:
+        try:
+            cid = int(float(row["cell_id"]))
+        except (KeyError, ValueError, TypeError):
+            continue
+        if 0 <= cid < n_neurons:
+            labels[cid] = _classify_row(row, spec)
+    return labels
+
+
+def count_labels(labels: list) -> dict:
+    """{label: count} over a label list (only labels that occur)."""
+    out: dict = {}
+    for lab in labels:
+        out[lab] = out.get(lab, 0) + 1
+    return out
 
 
 def _load_bad(path: Path, n_neurons: int) -> set:
